@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich>=15,<16"]
+# ///
 """Builds the DSpark draft-vocabulary shortlist for inkling-rs (`inkling bench --spec --draft-vocab FILE`).
 
 Source: ingine's checked-in `native/src/kernels/draft/draft_shortlist.bin` (Apache-2.0, third_party/ingine),
@@ -9,18 +13,37 @@ provenance is unknown).
 
 Checks: every id < 200,058 (the unpadded vocabulary), no duplicates, EOS present, sorted.
 
-    python -I scripts/build_draft_vocab.py --tokenizer <model dir>/tokenizer.json --top 32768 \
+    uv run --script scripts/build_draft_vocab.py --tokenizer <model dir>/tokenizer.json --top 32768 \
         --out assets/draft_vocab_32k.bin
+
+The summary line is colored in a terminal (not when piped or with NO_COLOR). Plain `python -I` works too.
 """
 import argparse
 import json
 import os
 import struct
+import sys
 
 VOCAB = 200058
 EOS = 200006
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SRC = os.path.join(HERE, "..", "third_party", "ingine", "native", "src", "kernels", "draft", "draft_shortlist.bin")
+
+
+def report(summary, out):
+    """Prints "summary -> out", in color in a terminal that has `rich`."""
+    forced = bool(os.environ.get("FORCE_COLOR"))
+    if not os.environ.get("NO_COLOR") and (forced or (os.environ.get("TERM") != "dumb" and sys.stdout.isatty())):
+        try:
+            from rich.console import Console
+            from rich.text import Text
+        except ImportError:  # plain `python`, without the script's dependencies
+            pass
+        else:
+            console = Console(force_terminal=True if forced else None)
+            console.print(Text.assemble((summary, "green"), " -> ", (out, "bold cyan")), soft_wrap=True)
+            return
+    print(f"{summary} -> {out}")
 
 
 def main():
@@ -47,7 +70,7 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "wb") as f:
         f.write(struct.pack(f"<{len(ids)}i", *ids))
-    print(f"{len(ids)} ids ({a.top} ranked + {len(special)} special, deduplicated) -> {a.out}")
+    report(f"{len(ids)} ids ({a.top} ranked + {len(special)} special, deduplicated)", a.out)
 
 
 if __name__ == "__main__":

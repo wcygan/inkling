@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = []
+# dependencies = ["rich>=15,<16", "rich-argparse>=1.7,<2"]
 # ///
 """inkling: download the weights, build the GPU kernels, and run the server.
 
@@ -24,6 +24,9 @@ next step, instead of failing later. The rules (checked with TLC, see docs/lifec
     one server of this repository.
   * Nothing rewrites the weights or the kernels while a server is loading them.
   * "verified" and "fresh" are recorded last, and only if the files did not change while the command ran.
+
+In a terminal the output has color, tables and a progress bar. Piped or redirected output, --json, and any run with
+NO_COLOR set are plain text. FORCE_COLOR turns color on when the output is not a terminal.
 """
 
 from __future__ import annotations
@@ -155,12 +158,57 @@ class Paths:
 P = Paths(ROOT)
 
 
-def say(msg: str = "") -> None:
-    print(msg, flush=True)
+# ---- output ----------------------------------------------------------------------------------------------------
+# Color is for people. A command prints the same words either way; `rich` is imported only when it will be used.
+GOOD, WARN, BAD, ACCENT = "green", "yellow", "bold red", "bold cyan"
+_CONSOLES: dict = {}
+
+
+def console():
+    """A Rich console when the output should be styled, else None (plain text)."""
+    if os.environ.get("NO_COLOR"):
+        return None
+    forced = bool(os.environ.get("FORCE_COLOR"))
+    if not forced and (os.environ.get("TERM") == "dumb" or not (sys.stdout and sys.stdout.isatty())):
+        return None
+    if forced not in _CONSOLES:
+        from rich.console import Console
+
+        _CONSOLES[forced] = Console(force_terminal=True if forced else None, highlight=False, emoji=False, markup=False)
+    return _CONSOLES[forced]
+
+
+def say(*parts: str | tuple[str, str]) -> None:
+    """Print one line made of parts: text, or (text, style). Brackets are printed as they are, and Rich does not break
+    long lines, so commands stay whole when copied."""
+    out = console()
+    if out is None:
+        print("".join(p if isinstance(p, str) else p[0] for p in parts), flush=True)
+        return
+    from rich.text import Text
+
+    out.print(Text.assemble(*parts), soft_wrap=True)
+    sys.stdout.flush()  # before a child process writes to the same terminal
 
 
 def step(msg: str) -> None:
-    say(f"==> {msg}")
+    say(("==> ", ACCENT), (msg, "bold"))
+
+
+@contextlib.contextmanager
+def hashing_progress(total: int):
+    """A progress bar over `total` bytes in a terminal. Yields the function that advances it, or None in plain text."""
+    out = console()
+    if out is None:
+        yield None
+        return
+    from rich.progress import BarColumn, DownloadColumn, Progress, TaskProgressColumn, TextColumn, TimeRemainingColumn, TransferSpeedColumn
+
+    columns = (TextColumn("   "), BarColumn(), TaskProgressColumn(), DownloadColumn(binary_units=True),
+               TransferSpeedColumn(), TimeRemainingColumn())
+    with Progress(*columns, console=out) as bar:
+        task = bar.add_task("hashing", total=total)
+        yield lambda n: bar.advance(task, n)
 
 
 # ---- the command lock ----------------------------------------------------------------------------------------
@@ -181,7 +229,7 @@ class CommandLock:
                 break
             except OSError:
                 if not told:
-                    say(f"Waiting for another inkling command to finish ({self.holder()})...")
+                    say((f"Waiting for another inkling command to finish ({self.holder()})...", WARN))
                     told = True
                 if time.monotonic() > deadline:
                     self.file.close()
@@ -264,7 +312,7 @@ def weights_state(paths: Paths, model_dir: Path) -> tuple[str, list[str]]:
     return "present", ["the files have not been checked against the pinned hashes since they last changed"]
 
 
-def _file_hash(f: Path, algo: str, size: int) -> str:
+def _file_hash(f: Path, algo: str, size: int, advance=None) -> str:
     h = hashlib.sha256() if algo == "sha256" else hashlib.sha1(f"blob {size}\0".encode())
     buf = bytearray(8 << 20)  # one buffer for the whole file: allocating a new chunk per read costs a quarter of the time
     view = memoryview(buf)
@@ -273,7 +321,9 @@ def _file_hash(f: Path, algo: str, size: int) -> str:
         while n := fh.readinto(buf):
             h.update(view[:n])
             done += n
-            if size > (1 << 30) and time.monotonic() - last > 5:
+            if advance:
+                advance(n)
+            elif size > (1 << 30) and time.monotonic() - last > 5:
                 say(f"    {f.name}: {100 * done // size}%")
                 last = time.monotonic()
     return h.hexdigest()
@@ -286,9 +336,11 @@ def verify_weights(paths: Paths, model_dir: Path) -> None:
         raise Refused([f"the checkpoint is {state}: " + "; ".join(why[:4]), "download it first: `inkling weights`"])
     before = {n: _snapshot(model_dir / n) for n in MANIFEST}
     paths.verified.unlink(missing_ok=True)
-    say(f"  hashing {len(MANIFEST)} files ({sum(size for _, size in MANIFEST.values()) / 2**30:.1f} GiB)")
-    with ThreadPoolExecutor(max_workers=4) as pool:  # the big file takes one thread and the small ones share the rest
-        jobs = {name: pool.submit(_file_hash, model_dir / name, "sha256" if len(digest) == 64 else "sha1", size)
+    total = sum(size for _, size in MANIFEST.values())
+    say(f"  hashing {len(MANIFEST)} files ({total / 2**30:.1f} GiB)")
+    # the big file takes one thread and the small ones share the rest
+    with hashing_progress(total) as advance, ThreadPoolExecutor(max_workers=4) as pool:
+        jobs = {name: pool.submit(_file_hash, model_dir / name, "sha256" if len(digest) == 64 else "sha1", size, advance)
                 for name, (digest, size) in sorted(MANIFEST.items(), key=lambda kv: -kv[1][1])}
         got = {name: job.result() for name, job in jobs.items()}
     bad = [f"{name}: hash {got[name][:16]}..., expected {digest[:16]}..." for name, (digest, _) in MANIFEST.items() if got[name] != digest]
@@ -301,7 +353,7 @@ def verify_weights(paths: Paths, model_dir: Path) -> None:
     tmp = paths.verified.with_suffix(".tmp")
     tmp.write_text(json.dumps({"revision": REVISION, "model_dir": str(model_dir), "files": after}))
     os.replace(tmp, paths.verified)
-    say(f"Checkpoint verified against revision {REVISION[:8]}.")
+    say((f"Checkpoint verified against revision {REVISION[:8]}.", GOOD))
 
 
 # ---- kernels -------------------------------------------------------------------------------------------------
@@ -631,7 +683,8 @@ def kernel_prerequisites() -> list[str]:
     return [_describe(c) for c in failing(run_checks(P, stages=("kernels",), optional=False), "kernels")]
 
 
-def render_doctor(checks: list[Check], stage: str) -> tuple[list[str], int]:
+def _doctor_report(checks: list[Check], stage: str) -> tuple[list[tuple[str, str, Check]], list[tuple[str, str]], int]:
+    """What `doctor` reports: (mark, needed, check) rows, the closing (line, style) pairs, and the exit code."""
     shown = [c for c in checks if stage == "all" or stage in c.needed_for or c.optional]
     def needed(c: Check) -> str:
         if c.optional:
@@ -639,23 +692,49 @@ def render_doctor(checks: list[Check], stage: str) -> tuple[list[str], int]:
         stages = [s for s in c.needed_for if stage in ("all", s)]
         return "needed for everything" if len(stages) == len(STAGES) else "needed for " + ", ".join(stages)
 
-    width, nwidth = max(len(c.title) for c in shown), max(len(needed(c)) for c in shown)
-    lines = []
-    for c in shown:
-        mark = "ok" if c.ok else ("skip" if c.optional else "MISSING")
-        lines.append(f"  [{mark:<7}] {c.title:<{width}}  {needed(c):<{nwidth}}  {c.detail}")
+    rows = [("ok" if c.ok else ("skip" if c.optional else "MISSING"), needed(c), c) for c in shown]
     missing = [c for c in shown if not c.ok and not c.optional]
     optional = [c for c in shown if not c.ok and c.optional]
-    lines.append("")
+    closing = []
     if missing:
-        lines.append(f"{len(missing)} required item(s) missing. Install them in this order (PowerShell; some installers ask for approval):")
-        lines += [f"  {i}. {c.fix}" for i, c in enumerate(missing, 1) if c.fix]
-        lines.append("Then open a NEW terminal, so the installs are on PATH, and run `inkling doctor` again.")
+        closing.append((f"{len(missing)} required item(s) missing. Install them in this order (PowerShell; some installers ask for approval):", BAD))
+        closing += [(f"  {i}. {c.fix}", "cyan") for i, c in enumerate(missing, 1) if c.fix]
+        closing.append(("Then open a NEW terminal, so the installs are on PATH, and run `inkling doctor` again.", WARN))
     else:
-        lines.append("Everything needed is installed." if stage == "all" else f"Everything needed for `{stage}` is installed.")
+        closing.append(("Everything needed is installed." if stage == "all" else f"Everything needed for `{stage}` is installed.",
+                        f"bold {GOOD}"))
     if optional:
-        lines.append("Optional: " + "; ".join(f"{c.title}: {c.fix}" for c in optional))
-    return lines, (EXIT_REFUSED if missing else 0)
+        closing.append(("Optional: " + "; ".join(f"{c.title}: {c.fix}" for c in optional), "dim"))
+    return rows, closing, (EXIT_REFUSED if missing else 0)
+
+
+def render_doctor(checks: list[Check], stage: str) -> tuple[list[str], int]:
+    """The plain-text report."""
+    rows, closing, code = _doctor_report(checks, stage)
+    width, nwidth = max(len(c.title) for _, _, c in rows), max(len(needed) for _, needed, _ in rows)
+    lines = [f"  [{mark:<7}] {c.title:<{width}}  {needed:<{nwidth}}  {c.detail}" for mark, needed, c in rows]
+    return lines + [""] + [line for line, _ in closing], code
+
+
+def show_doctor(checks: list[Check], stage: str) -> int:
+    """The same report as a table, for a terminal."""
+    from rich import box
+    from rich.table import Table
+    from rich.text import Text
+
+    rows, closing, code = _doctor_report(checks, stage)
+    styles = {"ok": GOOD, "skip": "dim", "MISSING": BAD}
+    table = Table(box=box.SIMPLE_HEAD, header_style="bold", pad_edge=False)
+    table.add_column("status", no_wrap=True)
+    table.add_column("tool")
+    table.add_column("needed for")
+    table.add_column("detail", overflow="fold")
+    for mark, needed, c in rows:
+        table.add_row(Text(mark, style=styles[mark]), c.title, Text(needed.removeprefix("needed for "), style="dim"), c.detail)
+    console().print(table)
+    for line in closing:
+        say(line)
+    return code
 
 
 def build_kernels(paths: Paths) -> None:
@@ -707,7 +786,7 @@ def build_kernels(paths: Paths) -> None:
         nvcc_tmp.unlink(missing_ok=True)
         raise Failed("`cargo oxide build` failed; read the output above")
     if nvcc_rc != 0:
-        say(nvcc_text)
+        print(nvcc_text, flush=True)  # the compiler's own text, as it wrote it
         raise Failed("nvcc failed; its output is above")
     built = out / "inkling_kernels.cubin"
     if not built.is_file():
@@ -721,7 +800,8 @@ def build_kernels(paths: Paths) -> None:
     paths.stamp.write_text(json.dumps({"sources_sha256": start_hash, "oxide_commit": OXIDE_COMMIT,
                                        "files": {n: _sha256_file(paths.kernels / n) for n in KERNEL_FILES}}, indent=1))
     for n in KERNEL_FILES:
-        say(f"  {n:<34} {(paths.kernels / n).stat().st_size:>10,} bytes  sha256 {_sha256_file(paths.kernels / n)[:16]}")
+        say("  ", (f"{n:<34}", "cyan"), f" {(paths.kernels / n).stat().st_size:>10,} bytes  ",
+            (f"sha256 {_sha256_file(paths.kernels / n)[:16]}", "dim"))
 
 
 # ---- the server ----------------------------------------------------------------------------------------------
@@ -846,7 +926,7 @@ def server_state(paths: Paths, port: int) -> str:
 def stop_servers(paths: Paths, port: int) -> int:
     procs = our_servers(paths)
     for r in procs:
-        say(f"Stopping the server (pid {r['ProcessId']}).")
+        say((f"Stopping the server (pid {r['ProcessId']}).", WARN))
         subprocess.run(["taskkill", "/PID", str(r["ProcessId"]), "/T", "/F"], capture_output=True)
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline and (our_servers(paths) or (procs and port_owner(port))):
@@ -960,7 +1040,7 @@ def sync_pi(path: str, port: int, max_ctx: int) -> None:
     for m in prov.get("models", []):
         m["contextWindow"] = max_ctx
     f.write_text(json.dumps(cfg, indent=2), encoding="utf-8")  # no BOM: Pi parses this with JSON.parse
-    say(f"Updated {f}: inkling contextWindow {max_ctx:,}, port {port}.")
+    say((f"Updated {f}: inkling contextWindow {max_ctx:,}, port {port}.", GOOD))
 
 
 def build_host(paths: Paths) -> None:
@@ -991,17 +1071,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     exe = P.exe.is_file()
     missing = [c for c in checks if not c.ok and not c.optional]
     if args.json:
-        say(json.dumps({"weights": w, "kernels": k, "engine": exe, "server": srv, "missing_tools": [c.key for c in missing],
-                        "model_dir": str(s.model_dir), "gpu": gpu}, indent=1))
+        print(json.dumps({"weights": w, "kernels": k, "engine": exe, "server": srv, "missing_tools": [c.key for c in missing],
+                          "model_dir": str(s.model_dir), "gpu": gpu}, indent=1), flush=True)
         return 0
-    say(f"weights   {w:<9} {s.model_dir}" + (f"  ({wwhy[0]})" if wwhy else ""))
-    say(f"kernels   {k:<9}" + (f"  ({kwhy[0]})" if kwhy else ""))
-    say(f"engine    {'built' if exe else 'not built'}")
-    say(f"server    {srv:<9} http://127.0.0.1:{s.port}/v1" if srv != "stopped" else "server    stopped")
-    say(f"gpu       {gpu.get('name', 'not found')}" + (f"  {gpu['free_gib']:.1f} of {gpu['total_gib']:.1f} GiB free" if gpu else ""))
     todo = []
     if missing:
-        say(f"setup     {len(missing)} required tool(s) missing: " + ", ".join(c.title for c in missing))
         todo.append("inkling doctor")
     if w in ("absent", "partial"):
         todo.append("inkling weights")
@@ -1011,8 +1085,58 @@ def cmd_status(args: argparse.Namespace) -> int:
         todo.append("inkling kernels")
     if not exe:
         todo.append("inkling build")
-    say("next      " + (", then ".join(todo) if todo else ("inkling serve" if srv == "stopped" else "ready to use")))
+    nxt = ", then ".join(todo) if todo else ("inkling serve" if srv == "stopped" else "ready to use")
+    # (label, state, the state's style, detail)
+    rows = [
+        ("weights", w, GOOD if w == "verified" else BAD if w == "absent" else WARN, f"{s.model_dir}" + (f"  ({wwhy[0]})" if wwhy else "")),
+        ("kernels", k, GOOD if k == "fresh" else BAD if k == "absent" else WARN, f"({kwhy[0]})" if kwhy else ""),
+        ("engine", "built" if exe else "not built", GOOD if exe else BAD, ""),
+        ("server", srv, GOOD if srv == "ready" else WARN, f"http://127.0.0.1:{s.port}/v1" if srv != "stopped" else ""),
+        ("gpu", "found" if gpu else "not found", GOOD if gpu else BAD,
+         f"{gpu['name']}  {gpu['free_gib']:.1f} of {gpu['total_gib']:.1f} GiB free" if gpu else ""),
+    ]
+    if missing:
+        rows.append(("setup", "incomplete", BAD, f"{len(missing)} required tool(s) missing: " + ", ".join(c.title for c in missing)))
+    if console():
+        show_status(rows, nxt)
+    else:
+        for line in render_status(rows, nxt):
+            say(line)
     return 0
+
+
+def render_status(rows: list[tuple[str, str, str, str]], nxt: str) -> list[str]:
+    """The plain-text report. A state is padded to 9 characters where a detail follows it."""
+    lines = []
+    for label, state, _, detail in rows:
+        if label == "setup":
+            text = detail
+        elif label == "gpu":  # the name says it was found
+            text = detail or state
+        elif label == "weights":
+            text = f"{state:<9} {detail}"
+        elif label == "kernels":  # padded even when nothing follows
+            text = f"{state:<9}" + (f"  {detail}" if detail else "")
+        else:
+            text = f"{state:<9} {detail}" if detail else state
+        lines.append(f"{label:<10}{text}")
+    return lines + [f"{'next':<10}{nxt}"]
+
+
+def show_status(rows: list[tuple[str, str, str, str]], nxt: str) -> None:
+    """The same report as a panel, for a terminal."""
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="bold", no_wrap=True)
+    table.add_column()
+    table.add_column(overflow="fold")
+    for label, state, style, detail in rows:
+        table.add_row(label, Text(state, style=style), detail)
+    console().print(Panel(table, title="inkling", title_align="left", border_style="cyan", expand=False))
+    say(("next  ", "bold"), (nxt, f"bold {GOOD}" if nxt == "ready to use" else ACCENT))
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -1020,8 +1144,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # --json lists every tool whatever the stage, as it always has; the text report shows only the stage's
     checks = run_checks(P, s.model_dir, stages=None if (args.stage == "all" or args.json) else (args.stage,))
     if args.json:
-        say(json.dumps([dataclasses.asdict(c) for c in checks], indent=1))
+        print(json.dumps([dataclasses.asdict(c) for c in checks], indent=1), flush=True)
         return 0 if not [c for c in checks if not c.ok and not c.optional and (args.stage == "all" or args.stage in c.needed_for)] else EXIT_REFUSED
+    if console():
+        return show_doctor(checks, args.stage)
     lines, code = render_doctor(checks, args.stage)
     for line in lines:
         say(line)
@@ -1033,7 +1159,7 @@ def cmd_weights(args: argparse.Namespace) -> int:
     with command_lock(P, "weights"):
         state, _ = weights_state(P, s.model_dir)
         if state == "verified" and not args.force:
-            say("The checkpoint is already downloaded and verified. Use --force to download it again.")
+            say(("The checkpoint is already downloaded and verified. Use --force to download it again.", GOOD))
             return 0
         if state in ("absent", "partial") or args.force:
             if our_servers(P):  # only a download rewrites files; checking them is safe while a server runs
@@ -1063,10 +1189,10 @@ def cmd_check_weights(args: argparse.Namespace) -> int:
 def cmd_kernels(args: argparse.Namespace) -> int:
     with command_lock(P, "kernels"):
         if kernel_state(P)[0] == "fresh" and not args.force:
-            say("The kernels are already built from the current sources. Use --force to build them again.")
+            say(("The kernels are already built from the current sources. Use --force to build them again.", GOOD))
             return 0
         build_kernels(P)
-        say("Kernels built.")
+        say(("Kernels built.", GOOD))
     return 0
 
 
@@ -1080,7 +1206,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     s = load_settings(P, args)
     with command_lock(P, "stop"):
         n = stop_servers(P, s.port)
-    say("Server stopped." if n else "No server of this repository is running.")
+    say(("Server stopped.", GOOD) if n else "No server of this repository is running.")
     return 0
 
 
@@ -1107,9 +1233,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if args.dry_run:
             warn = None if our_servers(P) else vram_warning(s)  # a running server's memory is freed by the replacement
             if warn:
-                say(f"Warning: {warn}")
-            say("Dry run: everything checks out. Would stop this repository's server if one is running, then start:")
-            say("  " + " ".join(argv))
+                say(("Warning: ", f"bold {WARN}"), (warn, WARN))
+            say(("Dry run: everything checks out.", GOOD), " Would stop this repository's server if one is running, then start:")
+            say(("  " + " ".join(argv), "cyan"))
             return 0
         stop_servers(P, s.port)
         shutil.copyfile(P.exe, P.serve_exe)  # after the old server stopped, so the copy is not locked
@@ -1118,7 +1244,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             raise Refused(["the checks changed while the old server was stopping:"] + why)
         warn = vram_warning(s)  # now that the old server has released its memory
         if warn:
-            say(f"Warning: {warn}")
+            say(("Warning: ", f"bold {WARN}"), (warn, WARN))
         if s.pi_models_json:
             sync_pi(s.pi_models_json, s.port, s.max_ctx)
         step(f"starting the server (max_ctx {s.max_ctx:,}, port {s.port})")
@@ -1132,11 +1258,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
             proc.terminate()
             return 130
         lock.release()  # loading is done; other commands may run now
-        say(f"Server ready: http://127.0.0.1:{s.port}/v1  (model inkling-2-mini). Ctrl+C stops it.")
+        say(("Server ready: ", f"bold {GOOD}"), (f"http://127.0.0.1:{s.port}/v1", ACCENT),
+            "  (model inkling-2-mini). Ctrl+C stops it.")
         try:
             code = proc.wait()
             if code == 1:  # what Windows reports for a process that was force-stopped
-                say("The server was stopped (from another terminal, or replaced by a newer `serve`).")
+                say(("The server was stopped (from another terminal, or replaced by a newer `serve`).", WARN))
                 return 0
             return code
         except KeyboardInterrupt:
@@ -1192,7 +1319,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unverified-weights", action="store_true", help="allow a complete checkpoint that has not been verified")
     p.add_argument("--dry-run", action="store_true", help="run every check and print the command, but start and stop nothing")
     p.set_defaults(fn=cmd_serve)
+    if console():
+        for parser in (ap, *sub.choices.values()):
+            parser.formatter_class = _color_help(parser.formatter_class)
     return ap
+
+
+def _color_help(plain: type) -> type:
+    """argparse's help in color, with the headings and the text as argparse writes them."""
+    import rich_argparse
+
+    raw = plain is argparse.RawDescriptionHelpFormatter
+    base = rich_argparse.RawDescriptionRichHelpFormatter if raw else rich_argparse.RichHelpFormatter
+
+    class Help(base):
+        group_name_formatter = str
+        help_markup = text_markup = False
+
+    return Help
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1200,15 +1344,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.fn(args)
     except Refused as e:
-        say("inkling: not done.")
+        say(("inkling: not done.", BAD))
         for r in e.reasons:
-            say(f"  - {r}" if not r.startswith("  ") and not r.endswith(":") else f"  {r}")
+            if not r.startswith("  ") and not r.endswith(":"):
+                say(("  - ", BAD), r)
+            else:
+                say("  ", (r, WARN if r.endswith(":") else ""))
         return EXIT_REFUSED
     except Failed as e:
-        say(f"inkling: failed: {e}")
+        say(("inkling: failed: ", BAD), str(e))
         return 1
     except KeyboardInterrupt:
-        say("inkling: interrupted.")
+        say(("inkling: interrupted.", WARN))
         return 130
 
 

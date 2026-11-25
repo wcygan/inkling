@@ -134,6 +134,10 @@ Without `just`, run `uv run --script scripts\inkling.py <command>` (`status`, `w
 `doctor`, `kernels`, `build`, `serve`, `stop`). `status` always tells you what to run next, and every command that cannot run
 yet says why and what to do, so you can run them in any order and the tool will tell you.
 
+In a terminal the commands show color, tables and a progress bar while hashing the weights, using
+[Rich](https://github.com/Textualize/rich) (`uv` installs it on the first run, from the versions locked in
+`scripts\inkling.py.lock`). Piped output, `--json` and any run with `NO_COLOR` set are plain text.
+
 ## Requirements
 
 `just doctor` checks all of this and tells you how to install what is missing.
