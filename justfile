@@ -1,4 +1,5 @@
-set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
+# cmd.exe starts in 12 ms; PowerShell takes about 350 ms for every recipe. (`pi` runs its own PowerShell script.)
+set windows-shell := ["cmd.exe", "/c"]
 
 # List the recipes
 default:

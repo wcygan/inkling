@@ -97,7 +97,9 @@ that. It:
 4. records the hash of the sources and of both files in `kernels\build-stamp.json`, last.
 
 It first checks that git, Rust, uv, the CUDA Toolkit, LLVM, libffi and Visual Studio are present and lists any that
-are missing. [`scripts\vsdev.cmd`](scripts/vsdev.cmd) sets up the compiler environment; it assumes the default
+are missing. The Visual Studio environment takes about 2.5 s to compute, so it is cached in `logs\vsenv.json` and
+recomputed automatically when `vsdev.cmd`, `PATH`, the variables it reads, or the Visual Studio and Windows SDK files it
+depends on change; delete the file to force it. [`scripts\vsdev.cmd`](scripts/vsdev.cmd) sets up the compiler environment; it assumes the default
 install locations, and `CUDA_PATH`, `LIBCLANG_PATH` and `VCPKG_ROOT` override them. The kernels are reproducible:
 the same sources give the same bytes (see [`kernels/README.md`](kernels/README.md)). If the build cannot find
 `lake.exe`, that is the case the patch fixes.

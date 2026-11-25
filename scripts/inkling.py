@@ -32,7 +32,6 @@ import argparse
 import contextlib
 import dataclasses
 import hashlib
-import http.client
 import json
 import os
 import platform
@@ -41,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 if sys.platform != "win32":
@@ -187,7 +187,7 @@ class CommandLock:
                     self.file.close()
                     self.file = None
                     raise Refused(f"another inkling command is still running ({self.holder()}); wait for it or stop it")
-                time.sleep(0.5)
+                time.sleep(0.1)
         info = json.dumps({"command": self.command, "pid": os.getpid()}).encode()
         self.file.seek(16)
         self.file.truncate(16)
@@ -266,11 +266,13 @@ def weights_state(paths: Paths, model_dir: Path) -> tuple[str, list[str]]:
 
 def _file_hash(f: Path, algo: str, size: int) -> str:
     h = hashlib.sha256() if algo == "sha256" else hashlib.sha1(f"blob {size}\0".encode())
+    buf = bytearray(8 << 20)  # one buffer for the whole file: allocating a new chunk per read costs a quarter of the time
+    view = memoryview(buf)
     done, last = 0, time.monotonic()
-    with open(f, "rb") as fh:
-        while chunk := fh.read(8 << 20):
-            h.update(chunk)
-            done += len(chunk)
+    with open(f, "rb", buffering=0) as fh:
+        while n := fh.readinto(buf):
+            h.update(view[:n])
+            done += n
             if size > (1 << 30) and time.monotonic() - last > 5:
                 say(f"    {f.name}: {100 * done // size}%")
                 last = time.monotonic()
@@ -284,12 +286,12 @@ def verify_weights(paths: Paths, model_dir: Path) -> None:
         raise Refused([f"the checkpoint is {state}: " + "; ".join(why[:4]), "download it first: `inkling weights`"])
     before = {n: _snapshot(model_dir / n) for n in MANIFEST}
     paths.verified.unlink(missing_ok=True)
-    bad = []
-    for name, (digest, size) in MANIFEST.items():
-        say(f"  hashing {name}")
-        got = _file_hash(model_dir / name, "sha256" if len(digest) == 64 else "sha1", size)
-        if got != digest:
-            bad.append(f"{name}: hash {got[:16]}..., expected {digest[:16]}...")
+    say(f"  hashing {len(MANIFEST)} files ({sum(size for _, size in MANIFEST.values()) / 2**30:.1f} GiB)")
+    with ThreadPoolExecutor(max_workers=4) as pool:  # the big file takes one thread and the small ones share the rest
+        jobs = {name: pool.submit(_file_hash, model_dir / name, "sha256" if len(digest) == 64 else "sha1", size)
+                for name, (digest, size) in sorted(MANIFEST.items(), key=lambda kv: -kv[1][1])}
+        got = {name: job.result() for name, job in jobs.items()}
+    bad = [f"{name}: hash {got[name][:16]}..., expected {digest[:16]}..." for name, (digest, _) in MANIFEST.items() if got[name] != digest]
     if bad:
         raise Failed("these files differ from the pinned revision; download them again (`inkling weights --force`):\n  " + "\n  ".join(bad))
     after = {n: _snapshot(model_dir / n) for n in MANIFEST}
@@ -349,9 +351,66 @@ def _run(cmd: list[str], cwd: Path | None = None, env: dict | None = None, quiet
                           stderr=subprocess.STDOUT if quiet else None).returncode
 
 
+def _stat_key(f: Path) -> list[int]:
+    st = f.stat()
+    return [st.st_mtime_ns, st.st_size]
+
+
+def _vs_environment(paths: Paths) -> dict[str, str]:
+    """The environment scripts/vsdev.cmd sets up: the Visual Studio C++ tools, CUDA, LLVM and vcpkg.
+
+    vcvars64.bat alone takes about 2.5 s, so the result is cached in logs/vsenv.json and reused while everything it
+    depends on is unchanged: vsdev.cmd, the variables it reads, PATH, and the Visual Studio files vcvars64.bat reads.
+    Anything else is recomputed. Only the variables the setup changed are cached, so the rest of the environment is
+    always the current one."""
+    cache = paths.logs / "vsenv.json"
+    inputs = {"vsdev": hashlib.sha256(paths.vsdev.read_bytes()).hexdigest(),
+              "path": hashlib.sha256(os.environ.get("PATH", "").encode()).hexdigest(),
+              **{k: os.environ.get(k, "") for k in ("CUDA_PATH", "CUDA_TOOLKIT_PATH", "LIBCLANG_PATH", "VCPKG_ROOT")}}
+    try:
+        data = json.loads(cache.read_text())
+        if data["inputs"] == inputs and all(Path(f).exists() and _stat_key(Path(f)) == key for f, key in data["watch"].items()):
+            env = dict(os.environ)
+            env.update(data["set"])
+            env["PATH"] = data["path"]
+            return env
+    except (OSError, ValueError, KeyError):
+        pass
+    r = subprocess.run(["cmd", "/c", str(paths.vsdev), "set"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Failed("could not set up the Visual Studio C++ environment (scripts\\vsdev.cmd); run `inkling doctor`")
+    captured: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        name, sep, value = line.partition("=")
+        if sep and name and not name.startswith("="):
+            captured[name.upper()] = value
+    parent = {k.upper(): v for k, v in os.environ.items()}
+    changed = {k: v for k, v in captured.items() if k != "PATH" and parent.get(k) != v}
+    build_dir = Path(captured.get("VCINSTALLDIR", "")) / "Auxiliary" / "Build"
+    kits = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Windows Kits" / "10"  # vcvars picks the newest SDK in here
+    watch = {str(f): _stat_key(f) for f in (paths.vsdev, build_dir / "vcvars64.bat", build_dir / "Microsoft.VCToolsVersion.default.txt",
+                                            kits / "Include", kits / "Lib") if f.exists()}
+    new_path = captured.get("PATH") or os.environ.get("PATH", "")
+    paths.logs.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"inputs": inputs, "watch": watch, "set": changed, "path": new_path}))
+    os.replace(tmp, cache)
+    env = dict(os.environ)
+    env.update(changed)
+    env["PATH"] = new_path
+    return env
+
+
 def _vs(paths: Paths, *cmd: str, cwd: Path | None = None, quiet: bool = False) -> int:
-    """Run a command inside the MSVC and CUDA environment set up by scripts/vsdev.cmd."""
-    return _run(["cmd", "/c", str(paths.vsdev), *cmd], cwd=cwd, quiet=quiet)
+    """Run a command inside the MSVC and CUDA environment that scripts/vsdev.cmd sets up (cached, see above)."""
+    env = _vs_environment(paths)
+    exe = shutil.which(cmd[0], path=env.get("PATH")) or cmd[0]
+    return _run([exe, *cmd[1:]], cwd=cwd, env=env, quiet=quiet)
+
+
+def _run_captured(cmd: list[str], env: dict) -> tuple[int, str]:
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    return r.returncode, (r.stdout + r.stderr).strip()
 
 
 # ---- doctor: what must be installed, and how to install what is missing ------------------------------------
@@ -415,9 +474,10 @@ def _free_gib(path: Path) -> float:
 
 
 def gpu_check() -> Check:
-    gpu = gpu_info()
-    smi = _out(["nvidia-smi"]) if gpu else ""
-    dm = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", smi)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        job_info, job_smi = pool.submit(gpu_info), pool.submit(_out, ["nvidia-smi"])
+        gpu, smi = job_info.result(), job_smi.result()
+    dm = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", smi) if gpu else None
     drv = (int(dm.group(1)), int(dm.group(2))) if dm else None
     if not gpu:
         ok, detail = False, "nvidia-smi found no NVIDIA GPU or driver"
@@ -442,84 +502,115 @@ def cublas_check() -> Check:
                  f"{cb}" + ("" if _on_path(cb) else " (not on PATH; `inkling serve` adds it for the server)"))
 
 
-def run_checks(paths: Paths, model_dir: Path | None = None) -> list[Check]:
-    """Every tool the commands need, in the order to install them. Each check says what it is needed for and how to fix it."""
-    model_dir = model_dir or default_model_dir()
-    out: list[Check] = []
-
-    def add(*a, **k) -> None:
-        out.append(Check(*a, **k))
-
+def os_check(paths: Paths, model_dir: Path) -> Check:
     ok = platform.machine().upper() in ("AMD64", "X86_64")
-    add("os", "Windows x64", STAGES, ok, f"{platform.system()} {platform.release()} {platform.machine()}",
-        "" if ok else "this project runs on Windows x64 only")
+    return Check("os", "Windows x64", STAGES, ok, f"{platform.system()} {platform.release()} {platform.machine()}",
+                 "" if ok else "this project runs on Windows x64 only")
 
+
+def uv_check(paths: Paths, model_dir: Path) -> Check:
     uv = shutil.which("uv")
-    add("uv", "uv", ("weights",), bool(uv), (_out([uv, "--version"]) if uv else "not found"), "winget install --id astral-sh.uv -e")
+    return Check("uv", "uv", ("weights",), bool(uv), (_out([uv, "--version"]) if uv else "not found"), "winget install --id astral-sh.uv -e")
 
+
+def git_check(paths: Paths, model_dir: Path) -> Check:
     git = shutil.which("git")
-    add("git", "git", ("kernels",), bool(git), (_out([git, "--version"]) if git else "not found"), "winget install --id Git.Git -e")
+    return Check("git", "git", ("kernels",), bool(git), (_out([git, "--version"]) if git else "not found"), "winget install --id Git.Git -e")
 
+
+def rust_check(paths: Paths, model_dir: Path) -> Check:
     rustup, cargo = shutil.which("rustup"), shutil.which("cargo")
     toolchain = paths.root / "rust-toolchain.toml"
     pinned = re.search(r'channel\s*=\s*"([^"]+)"', toolchain.read_text()) if toolchain.is_file() else None
     channel = pinned.group(1) if pinned else "the pinned toolchain"
     if rustup and cargo:
-        have = channel in _out([rustup, "toolchain", "list"])
+        # the installed toolchains are folders under RUSTUP_HOME; asking `rustup toolchain list` costs a process for the same answer
+        home = Path(os.environ.get("RUSTUP_HOME") or Path.home() / ".rustup") / "toolchains"
+        have = any(channel in d.name for d in home.iterdir()) if home.is_dir() else channel in _out([rustup, "toolchain", "list"])
         detail = f"rustup found; Rust {channel} " + ("is installed" if have else "installs itself on the first build (needs network)")
     else:
         detail = "not found"
-    add("rust", "Rust (rustup)", ("build", "kernels"), bool(rustup and cargo), detail, "winget install --id Rustlang.Rustup -e")
+    return Check("rust", "Rust (rustup)", ("build", "kernels"), bool(rustup and cargo), detail, "winget install --id Rustlang.Rustup -e")
 
+
+def msvc_check(paths: Paths, model_dir: Path) -> Check:
     vs = vs_install()
-    add("msvc", "Visual Studio C++ tools", ("build", "kernels"), vs is not None, str(vs) if vs else "not found",
-        'winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--passive --wait '
-        '--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"')
+    return Check("msvc", "Visual Studio C++ tools", ("build", "kernels"), vs is not None, str(vs) if vs else "not found",
+                 'winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--passive --wait '
+                 '--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"')
 
+
+def cuda_check(paths: Paths, model_dir: Path) -> Check:
     nvcc = cuda_dir() / "bin" / "nvcc.exe"
     m = re.search(r"release (\d+)\.(\d+)", _out([str(nvcc), "--version"])) if nvcc.is_file() else None
     ver = (int(m.group(1)), int(m.group(2))) if m else None
-    cuda_ok = ver is not None and ver >= CUDA_MIN
-    if cuda_ok:
-        cuda_detail = f"CUDA {ver[0]}.{ver[1]} at {cuda_dir()}"
+    ok = ver is not None and ver >= CUDA_MIN
+    if ok:
+        detail = f"CUDA {ver[0]}.{ver[1]} at {cuda_dir()}"
     elif ver:
-        cuda_detail = f"CUDA {ver[0]}.{ver[1]} found at {cuda_dir()}; 13.5 or newer is needed"
+        detail = f"CUDA {ver[0]}.{ver[1]} found at {cuda_dir()}; 13.5 or newer is needed"
     else:
-        cuda_detail = f"nvcc not found in {cuda_dir()}"
-    add("cuda", "CUDA Toolkit 13.5 (nvcc)", ("kernels",), cuda_ok, cuda_detail,
-        "winget install --id Nvidia.CUDA --version 13.5 -e   (if the installer offers a display driver, keep your current one; "
-        "if CUDA is installed elsewhere, set CUDA_PATH)")
+        detail = f"nvcc not found in {cuda_dir()}"
+    return Check("cuda", "CUDA Toolkit 13.5 (nvcc)", ("kernels",), ok, detail,
+                 "winget install --id Nvidia.CUDA --version 13.5 -e   (if the installer offers a display driver, keep your current one; "
+                 "if CUDA is installed elsewhere, set CUDA_PATH)")
 
+
+def llvm_check(paths: Paths, model_dir: Path) -> Check:
     clang = Path(os.environ.get("LIBCLANG_PATH", r"C:\Program Files\LLVM\bin"))
-    has_clang = (clang / "libclang.dll").is_file()
-    add("llvm", "LLVM (libclang)", ("kernels",), has_clang, str(clang) if has_clang else f"libclang.dll not found in {clang}",
-        "winget install --id LLVM.LLVM -e   (if LLVM is installed elsewhere, set LIBCLANG_PATH)")
+    has = (clang / "libclang.dll").is_file()
+    return Check("llvm", "LLVM (libclang)", ("kernels",), has, str(clang) if has else f"libclang.dll not found in {clang}",
+                 "winget install --id LLVM.LLVM -e   (if LLVM is installed elsewhere, set LIBCLANG_PATH)")
 
+
+def libffi_check(paths: Paths, model_dir: Path) -> Check:
     vcpkg = Path(os.environ.get("VCPKG_ROOT", r"C:\vcpkg"))
     ffi = list((vcpkg / "installed" / "x64-windows" / "lib").glob("ffi*.lib"))
-    add("libffi", "libffi (vcpkg)", ("kernels",), bool(ffi), f"found under {vcpkg}" if ffi else f"not found under {vcpkg}",
-        f"git clone https://github.com/microsoft/vcpkg {vcpkg}; {vcpkg}{BS}bootstrap-vcpkg.bat -disableMetrics; "
-        f"{vcpkg}{BS}vcpkg.exe install libffi:x64-windows   (if vcpkg is elsewhere, set VCPKG_ROOT)")
+    return Check("libffi", "libffi (vcpkg)", ("kernels",), bool(ffi), f"found under {vcpkg}" if ffi else f"not found under {vcpkg}",
+                 f"git clone https://github.com/microsoft/vcpkg {vcpkg}; {vcpkg}{BS}bootstrap-vcpkg.bat -disableMetrics; "
+                 f"{vcpkg}{BS}vcpkg.exe install libffi:x64-windows   (if vcpkg is elsewhere, set VCPKG_ROOT)")
 
-    out.append(gpu_check())
-    out.append(cublas_check())
 
+def disk_check(paths: Paths, model_dir: Path) -> Check:
     w, _ = weights_state(paths, model_dir)
     if w in ("absent", "partial"):
         free = _free_gib(model_dir)
-        add("disk", f"{DISK_NEEDED_GIB} GiB of free disk for the weights", ("weights",), free >= DISK_NEEDED_GIB,
-            f"{free:.0f} GiB free on the drive of {model_dir}",
-            "free some space, or put the checkpoint on another drive with --model-dir or `model_dir` in serve.config.json")
-    else:
-        add("disk", "disk space for the weights", ("weights",), True, "the checkpoint is already downloaded")
+        return Check("disk", f"{DISK_NEEDED_GIB} GiB of free disk for the weights", ("weights",), free >= DISK_NEEDED_GIB,
+                     f"{free:.0f} GiB free on the drive of {model_dir}",
+                     "free some space, or put the checkpoint on another drive with --model-dir or `model_dir` in serve.config.json")
+    return Check("disk", "disk space for the weights", ("weights",), True, "the checkpoint is already downloaded")
 
-    have_just = bool(shutil.which("just"))
-    add("just", "just (shortcuts)", (), have_just, "found" if have_just else "not found; use `uv run --script scripts/inkling.py ...` instead",
-        "winget install --id Casey.Just -e", optional=True)
-    have_pi = bool(shutil.which("pi"))
-    add("pi", "Pi coding agent", (), have_pi, "found" if have_pi else "not found",
-        "npm i -g @mariozechner/pi-coding-agent   (needs Node.js)", optional=True)
-    return out
+
+def just_check(paths: Paths, model_dir: Path) -> Check:
+    have = bool(shutil.which("just"))
+    return Check("just", "just (shortcuts)", (), have, "found" if have else "not found; use `uv run --script scripts/inkling.py ...` instead",
+                 "winget install --id Casey.Just -e", optional=True)
+
+
+def pi_check(paths: Paths, model_dir: Path) -> Check:
+    have = bool(shutil.which("pi"))
+    return Check("pi", "Pi coding agent", (), have, "found" if have else "not found",
+                 "npm i -g @mariozechner/pi-coding-agent   (needs Node.js)", optional=True)
+
+
+# (probe, the stages that need it, optional): in the order to install the tools
+PROBES = (
+    (os_check, STAGES, False), (uv_check, ("weights",), False), (git_check, ("kernels",), False),
+    (rust_check, ("build", "kernels"), False), (msvc_check, ("build", "kernels"), False), (cuda_check, ("kernels",), False),
+    (llvm_check, ("kernels",), False), (libffi_check, ("kernels",), False),
+    (lambda paths, model_dir: gpu_check(), ("run", "kernels"), False), (lambda paths, model_dir: cublas_check(), ("run",), False),
+    (disk_check, ("weights",), False), (just_check, (), True), (pi_check, (), True),
+)
+
+
+def run_checks(paths: Paths, model_dir: Path | None = None, stages: tuple[str, ...] | None = None, optional: bool = True) -> list[Check]:
+    """The tools the commands need, in the order to install them. `stages` limits it to what those stages need, and
+    `optional` says whether to include the optional tools. The probes are independent, so they run side by side."""
+    model_dir = model_dir or default_model_dir()
+    chosen = [fn for fn, needed, opt in PROBES
+              if (not opt or optional) and (stages is None or any(s in needed for s in stages) or opt)]
+    with ThreadPoolExecutor(max_workers=max(1, len(chosen))) as pool:
+        return list(pool.map(lambda fn: fn(paths, model_dir), chosen))
 
 
 def failing(checks: list[Check], stage: str) -> list[Check]:
@@ -531,13 +622,13 @@ def _describe(c: Check) -> str:
 
 
 def refuse_if_missing(paths: Paths, stage: str, model_dir: Path | None = None) -> None:
-    bad = failing(run_checks(paths, model_dir), stage)
+    bad = failing(run_checks(paths, model_dir, stages=(stage,), optional=False), stage)
     if bad:
         raise Refused([_describe(c) for c in bad] + ["`inkling doctor` checks everything and lists the commands"])
 
 
 def kernel_prerequisites() -> list[str]:
-    return [_describe(c) for c in failing(run_checks(P), "kernels")]
+    return [_describe(c) for c in failing(run_checks(P, stages=("kernels",), optional=False), "kernels")]
 
 
 def render_doctor(checks: list[Check], stage: str) -> tuple[list[str], int]:
@@ -601,18 +692,26 @@ def build_kernels(paths: Paths) -> None:
     start_hash = sources_hash(paths)
     out = paths.root / "crates" / "kernel-build" / "kernels"
     shutil.rmtree(out, ignore_errors=True)
-    step(f"compiling crates/inkling-kernels for {KERNEL_ARCH} (cargo oxide build)")
-    if _vs(paths, "cargo", "oxide", "build", "--arch", KERNEL_ARCH, cwd=paths.root / "crates" / "kernel-build") != 0:
-        raise Failed("`cargo oxide build` failed; read the output above")
     paths.kernels.mkdir(exist_ok=True)
+    env = _vs_environment(paths)  # once, before the two compilers start
+    cu = paths.root / "crates" / "inkling-kernels" / "cuda" / "z_adaptive_select_width.cu"
+    nvcc_tmp = paths.kernels / "z_adaptive_select_width.cubin.tmp"
+    nvcc_cmd = [shutil.which("nvcc", path=env.get("PATH")) or "nvcc", "-O3", "-std=c++17", "-gencode", f"arch=compute_120a,code={KERNEL_ARCH}",
+                "-cubin", str(cu), "-o", str(nvcc_tmp)]
+    step(f"compiling crates/inkling-kernels for {KERNEL_ARCH} (cargo oxide build) and z_adaptive_select_width.cu (nvcc), side by side")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        nvcc_job = pool.submit(_run_captured, nvcc_cmd, env)
+        oxide_rc = _vs(paths, "cargo", "oxide", "build", "--arch", KERNEL_ARCH, cwd=paths.root / "crates" / "kernel-build")
+        nvcc_rc, nvcc_text = nvcc_job.result()
+    if oxide_rc != 0:
+        nvcc_tmp.unlink(missing_ok=True)
+        raise Failed("`cargo oxide build` failed; read the output above")
+    if nvcc_rc != 0:
+        say(nvcc_text)
+        raise Failed("nvcc failed; its output is above")
     built = out / "inkling_kernels.cubin"
     if not built.is_file():
         raise Failed(f"cargo oxide reported success but {built} does not exist")
-    step("compiling z_adaptive_select_width.cu with nvcc")
-    cu = paths.root / "crates" / "inkling-kernels" / "cuda" / "z_adaptive_select_width.cu"
-    nvcc_out = paths.kernels / "z_adaptive_select_width.cubin.tmp"
-    if _vs(paths, "nvcc", "-O3", "-std=c++17", "-gencode", f"arch=compute_120a,code={KERNEL_ARCH}", "-cubin", str(cu), "-o", str(nvcc_out)) != 0:
-        raise Failed("nvcc failed; read the output above")
     shutil.copyfile(built, paths.kernels / "inkling_kernels.cubin.tmp")
     for name in KERNEL_FILES:
         os.replace(paths.kernels / f"{name}.tmp", paths.kernels / name)
@@ -635,13 +734,86 @@ def _powershell_json(script: str):
     return data if isinstance(data, list) else [data]
 
 
+_WIN32 = None
+
+
+def _win32():
+    """kernel32 with the signatures this tool uses (loaded on first use)."""
+    global _WIN32
+    if _WIN32 is None:
+        import ctypes
+        from ctypes import wintypes
+
+        class Entry(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", wintypes.WCHAR * 260)]
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k.Process32FirstW.argtypes = k.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(Entry)]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        _WIN32 = (ctypes, wintypes, k, Entry)
+    return _WIN32
+
+
+def _processes(names: set[str]) -> list[tuple[int, str]]:
+    """(pid, image name) of the running processes whose image name is in `names`: one process snapshot, a few milliseconds."""
+    ctypes, wintypes, k, Entry = _win32()
+    snap = k.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return []
+    found = []
+    try:
+        entry = Entry()
+        entry.dwSize = ctypes.sizeof(Entry)
+        ok = k.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() in names:
+                found.append((entry.th32ProcessID, entry.szExeFile))
+            ok = k.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k.CloseHandle(snap)
+    return found
+
+
+def _image_path(pid: int) -> str | None:
+    """The full path of a running process's executable, or None if it is not readable."""
+    ctypes, wintypes, k, _ = _win32()
+    handle = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buf))
+        return buf.value if k.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)) else None
+    finally:
+        k.CloseHandle(handle)
+
+
 def our_servers(paths: Paths) -> list[dict]:
-    """Running `inkling.exe serve` processes of this repository (other copies of inkling are left alone)."""
-    rows = _powershell_json("Get-CimInstance Win32_Process -Filter \"Name='inkling.exe' OR Name='inkling-serve.exe'\" | "
-                            "Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress")
+    """Running servers of this repository: `inkling-serve.exe` (the copy `serve` runs) and `inkling.exe serve` (a server an
+    older version started). Other copies of inkling are left alone."""
     mine = {os.path.normcase(str(p.resolve())) for p in (paths.exe, paths.serve_exe)}
-    return [r for r in rows if r.get("ExecutablePath") and os.path.normcase(r["ExecutablePath"]) in mine
-            and re.search(r"\sserve(\s|$)", r.get("CommandLine") or "")]
+    found, legacy = [], []
+    for pid, name in _processes({"inkling.exe", "inkling-serve.exe"}):
+        path = _image_path(pid)
+        if not path or os.path.normcase(path) not in mine:
+            continue
+        if name.lower() == "inkling-serve.exe":
+            found.append({"ProcessId": pid, "ExecutablePath": path, "CommandLine": None})
+        else:
+            legacy.append(pid)
+    if legacy:  # only an `inkling.exe serve` counts, which needs its command line: rare, so the slow query is fine
+        rows = _powershell_json("Get-CimInstance Win32_Process -Filter \"" + " OR ".join(f"ProcessId={p}" for p in legacy) + "\" | "
+                                "Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress")
+        found += [r for r in rows if re.search(r"\sserve(\s|$)", r.get("CommandLine") or "")]
+    return found
 
 
 def port_owner(port: int) -> dict | None:
@@ -649,14 +821,14 @@ def port_owner(port: int) -> dict | None:
     for line in out.splitlines():
         cols = line.split()
         if len(cols) >= 5 and cols[3] == "LISTENING" and cols[1].rsplit(":", 1)[-1] == str(port):
-            rows = _powershell_json(f"Get-CimInstance Win32_Process -Filter \"ProcessId={int(cols[4])}\" | "
-                                    "Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress")
-            return rows[0] if rows else {"ProcessId": int(cols[4]), "ExecutablePath": None}
+            return {"ProcessId": int(cols[4]), "ExecutablePath": _image_path(int(cols[4]))}
     return None
 
 
 def health(port: int) -> int | None:
     """200 ready, 503 loading, None nothing listening."""
+    import http.client
+
     try:
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
         c.request("GET", "/health")
@@ -678,7 +850,7 @@ def stop_servers(paths: Paths, port: int) -> int:
         subprocess.run(["taskkill", "/PID", str(r["ProcessId"]), "/T", "/F"], capture_output=True)
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline and (our_servers(paths) or (procs and port_owner(port))):
-        time.sleep(0.5)
+        time.sleep(0.1)
     if our_servers(paths):
         raise Failed("the running server did not stop")
     return len(procs)
@@ -749,18 +921,19 @@ def load_settings(paths: Paths, args: argparse.Namespace) -> Settings:
 
 def serve_checks(paths: Paths, s: Settings, unverified_ok: bool) -> list[str]:
     """Why `serve` cannot start now. Empty means it can. Runs before the old server is stopped, and again just before the start."""
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        jobs = (pool.submit(weights_state, paths, s.model_dir), pool.submit(kernel_state, paths), pool.submit(gpu_check),
+                pool.submit(cublas_check), pool.submit(port_owner, s.port), pool.submit(our_servers, paths))
+        (w, wwhy), (k, kwhy), gpu_c, cublas_c, owner, ours = (j.result() for j in jobs)
     why = []
-    w, wwhy = weights_state(paths, s.model_dir)
     if w in ("absent", "partial"):
         why.append(f"the checkpoint is {w} ({'; '.join(wwhy[:3])}). Download it: `inkling weights`")
     elif w == "present" and not unverified_ok:
         why.append("the checkpoint has not been verified. Run `inkling check-weights` (or pass --unverified-weights to skip the check)")
-    k, kwhy = kernel_state(paths)
     if k != "fresh":
         why.append(f"the GPU kernels are {k} ({kwhy[0]}). Build them: `inkling kernels`")
-    why += [_describe(c) for c in (gpu_check(), cublas_check()) if not c.ok]
-    owner = port_owner(s.port)
-    if owner and not any(r["ProcessId"] == owner["ProcessId"] for r in our_servers(paths)):
+    why += [_describe(c) for c in (gpu_c, cublas_c) if not c.ok]
+    if owner and not any(r["ProcessId"] == owner["ProcessId"] for r in ours):
         why.append(f"port {s.port} is used by {owner.get('ExecutablePath') or 'another program'} (pid {owner['ProcessId']}), which is not this repository's server. Stop it or choose another --port")
     return why
 
@@ -804,20 +977,22 @@ def wait_ready(port: int, proc: subprocess.Popen, timeout: float = 300.0) -> Non
             raise Failed(f"the server exited with code {proc.returncode} while loading; its output is above")
         if health(port) == 200:
             return
-        time.sleep(0.5)
+        time.sleep(0.1)
     raise Failed(f"the server was not ready after {timeout:.0f} s")
 
 
 # ---- commands ------------------------------------------------------------------------------------------------
 def cmd_status(args: argparse.Namespace) -> int:
     s = load_settings(P, args)
-    w, wwhy = weights_state(P, s.model_dir)
-    k, kwhy = kernel_state(P)
-    srv = server_state(P, s.port)
-    gpu = gpu_info()
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        jobs = (pool.submit(weights_state, P, s.model_dir), pool.submit(kernel_state, P), pool.submit(server_state, P, s.port),
+                pool.submit(gpu_info), pool.submit(run_checks, P, s.model_dir))
+        (w, wwhy), (k, kwhy), srv, gpu, checks = (j.result() for j in jobs)
     exe = P.exe.is_file()
+    missing = [c for c in checks if not c.ok and not c.optional]
     if args.json:
-        say(json.dumps({"weights": w, "kernels": k, "engine": exe, "server": srv, "missing_tools": [c.key for c in run_checks(P, s.model_dir) if not c.ok and not c.optional], "model_dir": str(s.model_dir), "gpu": gpu}, indent=1))
+        say(json.dumps({"weights": w, "kernels": k, "engine": exe, "server": srv, "missing_tools": [c.key for c in missing],
+                        "model_dir": str(s.model_dir), "gpu": gpu}, indent=1))
         return 0
     say(f"weights   {w:<9} {s.model_dir}" + (f"  ({wwhy[0]})" if wwhy else ""))
     say(f"kernels   {k:<9}" + (f"  ({kwhy[0]})" if kwhy else ""))
@@ -825,7 +1000,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     say(f"server    {srv:<9} http://127.0.0.1:{s.port}/v1" if srv != "stopped" else "server    stopped")
     say(f"gpu       {gpu.get('name', 'not found')}" + (f"  {gpu['free_gib']:.1f} of {gpu['total_gib']:.1f} GiB free" if gpu else ""))
     todo = []
-    missing = [c for c in run_checks(P, s.model_dir) if not c.ok and not c.optional]
     if missing:
         say(f"setup     {len(missing)} required tool(s) missing: " + ", ".join(c.title for c in missing))
         todo.append("inkling doctor")
@@ -843,7 +1017,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     s = load_settings(P, args)
-    checks = run_checks(P, s.model_dir)
+    # --json lists every tool whatever the stage, as it always has; the text report shows only the stage's
+    checks = run_checks(P, s.model_dir, stages=None if (args.stage == "all" or args.json) else (args.stage,))
     if args.json:
         say(json.dumps([dataclasses.asdict(c) for c in checks], indent=1))
         return 0 if not [c for c in checks if not c.ok and not c.optional and (args.stage == "all" or args.stage in c.needed_for)] else EXIT_REFUSED
