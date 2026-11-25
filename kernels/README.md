@@ -20,5 +20,5 @@ files are complete and the sources did not change meanwhile, so an interrupted o
 used by `serve`. After you edit a kernel source, `just serve` refuses until you run `just kernels` again.
 
 The build is reproducible: from the same sources and the pinned cuda-oxide commit, `inkling_kernels.cubin` has the
-SHA-256 `1a83f48ab368b77040877eb64c56488abc85f8696e290743a3d610f9291aac00` and `z_adaptive_select_width.cubin`
+SHA-256 `033558d235ae907be72e13967662e4da3a75f3fb046520666a8ee70898a0cf04` and `z_adaptive_select_width.cubin`
 starts with `cd0675a184345ad8`.

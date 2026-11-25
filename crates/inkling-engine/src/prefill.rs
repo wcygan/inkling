@@ -52,6 +52,9 @@ fn global_splits() -> i32 {
 }
 
 const MOE_MMA_SMEM: u32 = 2 * (128 + 64) * 128 * 2;
+/// Dynamic shared memory of `prefill_moe_{up,down}_wg` (`MOE_WG_SMEM`: three activation stages, three code slots,
+/// the tile's scales, the E2M1 table).
+const MOE_WG_SMEM: u32 = (3 * 128 * 64 * 2 + 3 * 128 * 80 + 128 * (H / 16) + 64) as u32;
 /// Dynamic shared memory of `prefill_moe_{up,down}_bs` (`MOE_BS_SMEM`: two stages of 64 + 128 code rows and scales).
 const MOE_BS_SMEM: u32 = 2 * ((64 + 128) * 80 + (64 + 128) * 8);
 /// Visits whose updated hidden state feeds the drafter (forward.rs `TAP_VISITS`).
@@ -133,6 +136,10 @@ struct K {
     /// Block-scaled FP4 tensor-core MoE (`prefill_moe_bs.rs`: tiles, activation quantizer, up, down), only with
     /// INKLING_WIDE_MOE=bs: it quantizes the activations to NVFP4, so it changes the arithmetic.
     moe_bs: Option<[Kernel; 4]>,
+    /// The port of ingine's grouped expert GEMM (`prefill_moe_wg.rs`: tiles, up, down) for chunks above 512
+    /// tokens: the default (measured 12 to 13% faster prefill than the grouped kernels below, same precisions,
+    /// a different order of sums). INKLING_WIDE_MOE=grouped selects the grouped kernels for every chunk size.
+    moe_wg: Option<[Kernel; 3]>,
     /// `prefill_route_logits_nvfp4` (the decode router's arithmetic), unless INKLING_WIDE_ROUTER=bf16.
     router8: Option<Kernel>,
 }
@@ -310,6 +317,8 @@ impl<'a> WidePrefill<'a> {
             o_fp8: (|| Some([m.function("linear_fp8_prefill_k3072_mt1")?, m.function("linear_fp8_prefill_k3072_mt2")?, m.function("linear_fp8_prefill_k3072_mt4")?]))(),
             moe_mma: (|| Some([m.function("prefill_moe_tiles")?, m.function("prefill_moe_up_mma")?, m.function("prefill_moe_down_mma")?]))()
                 .filter(|_| std::env::var("INKLING_WIDE_MOE").is_ok_and(|v| v == "mma")),
+            moe_wg: (|| Some([m.function("prefill_moe_tiles_n")?, m.function("prefill_moe_up_wg")?, m.function("prefill_moe_down_wg")?]))()
+                .filter(|_| std::env::var("INKLING_WIDE_MOE").map_or(true, |v| v == "wg")),
             moe_bs: (|| Some([m.function("prefill_moe_tiles")?, m.function("prefill_quant_f16_to_nvfp4")?, m.function("prefill_moe_up_bs")?, m.function("prefill_moe_down_bs")?]))()
                 .filter(|_| std::env::var("INKLING_WIDE_MOE").is_ok_and(|v| v == "bs")),
             router8: m.function("prefill_route_logits_nvfp4").filter(|_| fwd.parts.router && std::env::var("INKLING_WIDE_ROUTER").map_or(true, |v| v != "bf16")),
@@ -344,6 +353,10 @@ impl<'a> WidePrefill<'a> {
         }
         if let Some(f4) = m.function("prefill_attn_flash4") {
             f4.set_max_dynamic_shared(FLASH4_SMEM).map_err(|e| e.to_string())?;
+        }
+        if let Some([_, ku, kd]) = k.moe_wg {
+            ku.set_max_dynamic_shared(MOE_WG_SMEM).map_err(|e| e.to_string())?;
+            kd.set_max_dynamic_shared(MOE_WG_SMEM).map_err(|e| e.to_string())?;
         }
         if let Some([_, _, ku, kd]) = k.moe_bs {
             ku.set_max_dynamic_shared(MOE_BS_SMEM).map_err(|e| e.to_string())?;
@@ -875,7 +888,18 @@ impl<'a> WidePrefill<'a> {
             a.push(b.route_ids).push((t * dims::TOP_K) as i32).push(b.offs).push(b.pairs);
             self.go(s, k.moe_group, (1, 1), 1024, a)?;
             let e = &lq.experts;
-            if let Some([kt, kq, ku, kd]) = k.moe_bs {
+            if let (Some([kt, ku, kd]), true) = (k.moe_wg, t > 512) {
+                let max_tiles = (t * dims::TOP_K / 128 + dims::EXPERTS) as u32;
+                let mut a = Args::new();
+                a.push(b.offs).push(b.tiles).push(b.tiles_n).push(128i32);
+                self.go(s, kt, (1, 1), 32, a)?;
+                let mut a = Args::new();
+                a.push(b.mlp_normed_h).push(b.offs).push(b.pairs).push(b.tiles).push(b.tiles_n).push(e.w13.ptr).push(e.w13_scales.ptr).push(e.w13_factor.ptr).push(b.act);
+                self.go_smem(s, ku, ((2 * dims::INTERMEDIATE / 128) as u32, max_tiles), 256, MOE_WG_SMEM, a)?;
+                let mut a = Args::new();
+                a.push(b.act).push(b.offs).push(b.pairs).push(b.tiles).push(b.tiles_n).push(b.route_w).push(e.w2.ptr).push(e.w2_scales.ptr).push(e.w2_factor.ptr).push(b.slots);
+                self.go_smem(s, kd, ((H / 128) as u32, max_tiles), 256, MOE_WG_SMEM, a)?;
+            } else if let Some([kt, kq, ku, kd]) = k.moe_bs {
                 let max_tiles = (t * dims::TOP_K / 64 + dims::EXPERTS) as u32;
                 let mut a = Args::new();
                 a.push(b.offs).push(b.tiles).push(b.tiles_n);
