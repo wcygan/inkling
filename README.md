@@ -111,7 +111,7 @@ just serve
 The server loads the weights (about 7 seconds with the files in the disk cache, longer on a cold read), then
 listens on `http://127.0.0.1:8013/v1`. `GET /health` returns 503 until it is ready. Starting `serve` again builds first, then stops this
 repository's running server and starts the new one, so there is only ever one. The server runs from a copy of the
-engine (`targetelease\inkling-serve.exe`), so `just build` also works while it is running. Ctrl+C stops it. `just stop` stops it from another
+engine (`target\release\inkling-serve.exe`), so `just build` also works while it is running. Ctrl+C stops it. `just stop` stops it from another
 terminal, and `just serve --dry-run` runs every check and prints the command without starting anything.
 
 Settings are in [`serve.config.json`](serve.config.json) (an unknown or mistyped setting is an error), and any of
