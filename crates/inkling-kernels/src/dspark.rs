@@ -184,6 +184,91 @@ pub unsafe fn dspark_mix(
     }
 }
 
+/// `dspark_mix` for a whole wide-prefill chunk (grid (T, 4), taps [4][T][H]): the same arithmetic per token, but
+/// only the chunk's last 16 tokens write the 16-slot f ring (what B = 8 commits in order leave there).
+/// `dspark_mix_kernel`: grid (B, 4), 256 threads. Mixes the 4 target taps
+/// with `fuse_alpha[m]`, RMSNorm, then the per-m norm; m < 3 writes
+/// `out_mix[m, b]`, m = 3 writes `f_ring[(pos + b) & 15]`.
+#[kernel]
+#[launch_bounds(256)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn prefill_dspark_mix(
+    taps: *const f32,
+    b_count: i32,
+    fuse_alpha: *const f32,
+    n0: *const u16,
+    n1: *const u16,
+    n2: *const u16,
+    n3: *const u16,
+    out_mix: *mut f32,
+    f_ring: *mut f32,
+    d_pos: *const i32,
+) {
+    static mut BUF: SharedArray<f32, { HIDDEN }, 16> = SharedArray::UNINIT;
+    static mut SM: SharedArray<f32, 8> = SharedArray::UNINIT;
+    static mut INV: SharedArray<f32, 1> = SharedArray::UNINIT;
+    unsafe {
+        let buf = SharedArray::as_raw_mut_ptr(&raw mut BUF);
+        let sm = SharedArray::as_raw_mut_ptr(&raw mut SM);
+        let inv = SharedArray::as_raw_mut_ptr(&raw mut INV);
+        let b = blockIdx_x() as usize;
+        let m = blockIdx_y() as usize;
+        let tid = threadIdx_x() as usize;
+        let bc = b_count as usize;
+        if m == 3 && b + 16 < bc {
+            return;
+        }
+        let a0 = *fuse_alpha.add(m * 4);
+        let a1 = *fuse_alpha.add(m * 4 + 1);
+        let a2 = *fuse_alpha.add(m * 4 + 2);
+        let a3 = *fuse_alpha.add(m * 4 + 3);
+        let t0 = taps.add(b * HIDDEN);
+        let t1 = taps.add((bc + b) * HIDDEN);
+        let t2 = taps.add((2 * bc + b) * HIDDEN);
+        let t3 = taps.add((3 * bc + b) * HIDDEN);
+
+        let mut sum_sq = 0.0f32;
+        let mut d = tid;
+        while d < HIDDEN {
+            // nvcc: fma(a3, t3, fma(a2, t2, fma(a0, t0, a1 * t1)))
+            let v = fmaf(a3, *t3.add(d), fmaf(a2, *t2.add(d), fmaf(a0, *t0.add(d), mul_rn(a1, *t1.add(d)))));
+            *buf.add(d) = v;
+            sum_sq = fmaf(v, v, sum_sq);
+            d += 256;
+        }
+        sum_sq = warp_sum(sum_sq);
+        if (tid & 31) == 0 {
+            *sm.add(tid >> 5) = sum_sq;
+        }
+        sync_threads();
+        if tid == 0 {
+            *inv = rsqrtf(div_rn(sum8(sm), HIDDEN as f32) + RMS_EPS);
+        }
+        sync_threads();
+
+        let nw = if m == 0 {
+            n0
+        } else if m == 1 {
+            n1
+        } else if m == 2 {
+            n2
+        } else {
+            n3
+        };
+        let dst = if m < 3 {
+            out_mix.add((m * bc + b) * HIDDEN)
+        } else {
+            f_ring.add((((*d_pos) + b as i32) & 15) as usize * HIDDEN)
+        };
+        let s = *inv;
+        let mut d = tid;
+        while d < HIDDEN {
+            *dst.add(d) = *buf.add(d) * s * bf16_to_f32(*nw.add(d));
+            d += 256;
+        }
+    }
+}
+
 /// `store_kv_head_128<1>`: one KV head (128 threads, value `x` each) as E4M3 codes plus an f16 scale per
 /// (slot, head): CTA amax through `sm[4]`, scale = max(amax / 448, 1e-8).
 #[device]
@@ -216,12 +301,13 @@ unsafe fn store_ctx_kv_body<const FP8: bool>(
     v_scale: *mut u16,
     cap: i32,
     d_pos: *const i32,
+    b_off: usize,
     sm: *mut f32,
     inv: *mut f32,
     kn: *mut f32,
 ) {
     unsafe {
-        let b = blockIdx_x() as usize;
+        let b = blockIdx_x() as usize + b_off;
         let h = blockIdx_y() as usize;
         let tid = threadIdx_x() as usize;
         let pos = *d_pos + b as i32;
@@ -256,6 +342,25 @@ unsafe fn store_ctx_kv_body<const FP8: bool>(
 }
 
 macro_rules! store_ctx_kernel {
+    ($name:ident, $fp8:expr, $doc:literal, $off:ident) => {
+        #[doc = $doc]
+        #[kernel]
+        #[launch_bounds(128)]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn $name(
+            kv: *const f32,
+            k_norm: *const u16,
+            k_cache: *mut u16,
+            v_cache: *mut u16,
+            k_scale: *mut u16,
+            v_scale: *mut u16,
+            cap: i32,
+            d_pos: *const i32,
+            $off: i32,
+        ) {
+            store_ctx_kernel!(@body $fp8, kv, k_norm, k_cache, v_cache, k_scale, v_scale, cap, d_pos, $off as usize);
+        }
+    };
     ($name:ident, $fp8:expr, $doc:literal) => {
         #[doc = $doc]
         #[kernel]
@@ -271,19 +376,25 @@ macro_rules! store_ctx_kernel {
             cap: i32,
             d_pos: *const i32,
         ) {
+            store_ctx_kernel!(@body $fp8, kv, k_norm, k_cache, v_cache, k_scale, v_scale, cap, d_pos, 0usize);
+        }
+    };
+    (@body $fp8:expr, $kv:ident, $k_norm:ident, $k_cache:ident, $v_cache:ident, $k_scale:ident, $v_scale:ident, $cap:ident, $d_pos:ident, $b_off:expr) => {
+        {
             static mut SM: SharedArray<f32, 4> = SharedArray::UNINIT;
             static mut INV: SharedArray<f32, 1> = SharedArray::UNINIT;
             static mut KN: SharedArray<f32, { HEAD_DIM }, 16> = SharedArray::UNINIT;
             unsafe {
                 store_ctx_kv_body::<$fp8>(
-                    kv,
-                    k_norm,
-                    k_cache,
-                    v_cache,
-                    k_scale,
-                    v_scale,
-                    cap,
-                    d_pos,
+                    $kv,
+                    $k_norm,
+                    $k_cache,
+                    $v_cache,
+                    $k_scale,
+                    $v_scale,
+                    $cap,
+                    $d_pos,
+                    $b_off,
                     SharedArray::as_raw_mut_ptr(&raw mut SM),
                     SharedArray::as_raw_mut_ptr(&raw mut INV),
                     SharedArray::as_raw_mut_ptr(&raw mut KN),
@@ -295,6 +406,8 @@ macro_rules! store_ctx_kernel {
 
 store_ctx_kernel!(dspark_store_ctx_kv_bf16, false, "`dspark_store_ctx_kv_kernel<0>`: grid (B, 8), 128 threads. V is stored as is; K gets a per-head RMSNorm and NeoX RoPE, both into BF16 caches. The scale pointers are unused for BF16.");
 store_ctx_kernel!(dspark_store_ctx_kv_fp8, true, "`dspark_store_ctx_kv_kernel<1>`: as the BF16 kernel, into E4M3 code caches (u8) with an f16 scale per (slot, KV head).");
+store_ctx_kernel!(prefill_dspark_store_ctx_kv_bf16, false, "`dspark_store_ctx_kv_bf16` for the wide prefill: CTA x is token `b_off + x` of the chunk (kv [T][2 KV_DIM]), so a launch can cover only the last `cap` tokens of a chunk. Same arithmetic.", b_off);
+store_ctx_kernel!(prefill_dspark_store_ctx_kv_fp8, true, "`dspark_store_ctx_kv_fp8` with a token offset, as `prefill_dspark_store_ctx_kv_bf16`.", b_off);
 // ---------------------------------------------------------------------------
 // Draft block: 8 rows (anchor + 7 masks) through 3 dense layers
 // ---------------------------------------------------------------------------

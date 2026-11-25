@@ -274,6 +274,8 @@ struct DKernels {
     stage2: Kernel,
     assemble: Kernel,
     spec_verify: Kernel,
+    /// The wide prefill's whole-chunk commit: mix, linear, BF16 store, FP8 store (`record_commit_wide`).
+    wide: Option<[Kernel; 4]>,
 }
 
 /// The drafter's recorders, bound to its weights, its state and the target's state.
@@ -333,6 +335,15 @@ impl<'a> Dspark<'a> {
             stage2: f("markov_fold_argmax_stage2")?,
             assemble: f("z_assemble_verify_tokens")?,
             spec_verify: f("spec_verify")?,
+            wide: (|| {
+                Some([
+                    module.function("prefill_dspark_mix")?,
+                    module.function("prefill_linear_nvfp4_f32")?,
+                    module.function("prefill_dspark_store_ctx_kv_bf16")?,
+                    module.function("prefill_dspark_store_ctx_kv_fp8")?,
+                ])
+            })()
+            .filter(|_| std::env::var("INKLING_WIDE_COMMIT").map_or(true, |v| v != "0")),
         };
         let mut plan = ArenaPlan::new();
         let s = plan_ds(&mut plan, w.vocab);
@@ -481,6 +492,65 @@ impl<'a> Dspark<'a> {
             p(&mut a, self.d_pos);
             let kern = if fp8.is_some() { self.k.store_ctx_fp8 } else { self.k.store_ctx };
             self.go(kern, (bsz as u32, dims::KV_HEADS as u32), 128, false, stream, a)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `record_commit_wide` is available (the kernels are in the cubin and INKLING_WIDE_COMMIT is not 0).
+    pub fn has_wide_commit(&self) -> bool {
+        self.k.wide.is_some()
+    }
+
+    /// The commit for a whole wide-prefill chunk: `t` tokens at positions `*d_pos + i` with their taps in
+    /// `taps` ([4][t][H] f32), in 1 + 2 * 3 launches instead of 7 per 8 tokens. `mix` ([3][t][H] f32) and `kv`
+    /// ([t][2 KV_DIM] f32) are scratch. Per token the arithmetic is `record_commit`'s, and what is left in the
+    /// f ring and in the local layers' rings is what B = 8 commits in order leave: the last 16 tokens, and the
+    /// last `cap` tokens (earlier ones would be overwritten). So the draft state is bit-identical.
+    pub fn record_commit_wide(&self, stream: &Stream, t: usize, taps: u64, mix: u64, kv_buf: u64) -> Result<(), String> {
+        let [k_mix, k_lin, k_store, k_store_fp8] = self.k.wide.ok_or("no wide commit kernels")?;
+        let w = self.w;
+        let mut a = Args::new();
+        p(&mut a, taps);
+        p(&mut a, t as i32);
+        p(&mut a, w.fuse_alpha);
+        for l in &w.layers {
+            p(&mut a, l.dflare_norm);
+        }
+        p(&mut a, w.markov_dflare_norm);
+        p(&mut a, mix);
+        p(&mut a, self.g(self.s.f_ring));
+        p(&mut a, self.d_pos);
+        self.go(k_mix, (t as u32, 4u32), 256, false, stream, a)?;
+        // Tokens per CTA of the linear: enough rows of CTAs to fill the GPU, few weight decodes.
+        let tb = (t / 16).clamp(1, 32);
+        for (l, lw) in w.layers.iter().enumerate() {
+            let kv = &lw.kv_ctx;
+            let mut a = Args::new();
+            p(&mut a, kv.data);
+            p(&mut a, kv.scales);
+            p(&mut a, kv.gs);
+            p(&mut a, mix + (l * t * H * 4) as u64);
+            p(&mut a, kv_buf);
+            p(&mut a, kv.rows as i32);
+            p(&mut a, H as i32);
+            p(&mut a, t as i32);
+            p(&mut a, tb as i32);
+            self.go(k_lin, (kv.rows.div_ceil(4) as u32, t.div_ceil(tb) as u32), 128, false, stream, a)?;
+            let (ck, cv, cap) = self.ctx[l];
+            let off = t.saturating_sub(cap);
+            let mut a = Args::new();
+            p(&mut a, kv_buf);
+            p(&mut a, lw.k_norm_ctx);
+            p(&mut a, ck);
+            p(&mut a, cv);
+            let fp8 = self.ctx_fp8.filter(|_| !is_local(l));
+            p(&mut a, fp8.map_or(NULL, |s| s.0));
+            p(&mut a, fp8.map_or(NULL, |s| s.1));
+            p(&mut a, cap as i32);
+            p(&mut a, self.d_pos);
+            p(&mut a, off as i32);
+            let kern = if fp8.is_some() { k_store_fp8 } else { k_store };
+            self.go(kern, ((t - off) as u32, dims::KV_HEADS as u32), 128, false, stream, a)?;
         }
         Ok(())
     }

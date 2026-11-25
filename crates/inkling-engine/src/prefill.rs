@@ -32,7 +32,7 @@ const FUSE_MAX: usize = 1024;
 /// decoded weights).
 const DENSE_TC_SMEM: u32 = (2 * (128 * 72 * 2 + 128 * 80) + 128 * 72 * 2) as u32;
 const T_MAX: usize = 2048;
-/// Tokens per K/V-store + attention slice: the local KV caches hold WINDOW + 256 positions.
+/// Tokens per K/V-store + attention slice of a global visit (local visits: `state::local_slice()`).
 const SLICE: usize = 256;
 const WORKSPACE: usize = 32 << 20;
 /// Dynamic shared memory of `prefill_moe_{up,down}_mma` (`MOE_MMA_SMEM`: two (128 + 64) x 128 f16 stages).
@@ -234,6 +234,14 @@ fn moe_r2c() -> bool {
     std::env::var("INKLING_WIDE_MOE_R2C").map_or(true, |v| v != "0")
 }
 
+/// Tokens each controller cluster runs in turn in a chunk of `t` (bit-identical to one cluster per token, with
+/// the weights loaded once per cluster): INKLING_WIDE_CTRL_TB, default 16, capped so that at least 128 clusters
+/// run at once; 0 selects the decode kernel with one cluster per token.
+fn ctrl_tb(t: usize) -> usize {
+    let tb = std::env::var("INKLING_WIDE_CTRL_TB").ok().and_then(|v| v.parse().ok()).unwrap_or(16usize);
+    if tb == 0 { 0 } else { tb.min(t / 128).max(1) }
+}
+
 fn chunk_sizes() -> Vec<usize> {
     let max = std::env::var("INKLING_WIDE_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(T_MAX);
     CHUNKS.iter().copied().filter(|&t| t <= max).collect()
@@ -268,7 +276,7 @@ impl<'a> WidePrefill<'a> {
             rmsnorm: f("rmsnorm")?,
             extract_block: f("extract_block")?,
             fused_depth_norm: f("fused_depth_norm")?,
-            controller: f("mega_controller_nvfp4_cl8")?,
+            controller: if ctrl_tb(T_MAX) > 0 { f("prefill_controller_nvfp4_cl8")? } else { f("mega_controller_nvfp4_cl8")? },
             bulk8: f("global_attn_bulk_splitk_bf16kv_b8")?,
             bulk8_fp8: f("global_attn_bulk_splitk_fp8kv_b8")?,
             tail8: f("local_tail_attn_tc_bf16kv_b8")?,
@@ -475,6 +483,17 @@ impl<'a> WidePrefill<'a> {
         unsafe { k.launch(&cfg, s, &mut args) }.map_err(|e| e.to_string())
     }
 
+    /// The controller for `t` tokens and `streams` streams: clusters of 8 CTAs that each run `ctrl_tb(t)` tokens
+    /// in turn, or one cluster per token with INKLING_WIDE_CTRL_TB=0.
+    fn go_ctrl(&self, s: &Stream, t: usize, streams: u32, mut a: Args) -> Result<(), String> {
+        let tb = ctrl_tb(t);
+        if tb == 0 {
+            return self.go(s, self.k.controller, (8 * t as u32, streams), 288, a);
+        }
+        a.push(tb as i32).push(t as i32);
+        self.go(s, self.k.controller, (8 * t.div_ceil(tb) as u32, streams), 288, a)
+    }
+
     fn to_bf16(&self, s: &Stream, src: u64, dst: u64, n: usize) -> Result<(), String> {
         let mut a = Args::new();
         a.push(src).push(dst).push(n as i32);
@@ -591,7 +610,7 @@ impl<'a> WidePrefill<'a> {
                 let mut a = Args::new();
                 a.push(xs).push(b.saved).push(b.prior_last).push(cpq).push(CtrlNvfp4([0, 1, 2].map(|m| [c[0][m], c[1][m], c[2][m]])));
                 a.push(post).push(PtrPack(b.attn_in)).push(PtrPack(b.attn_in_h));
-                self.go(s, k.controller, (8 * tu, 3), 288, a)?;
+                self.go_ctrl(s, t, 3, a)?;
             }
 
             // C. Projections: FP8 prefill GEMMs on the fp8 mode's weights, or cuBLAS BF16 on the checkpoint's.
@@ -625,7 +644,7 @@ impl<'a> WidePrefill<'a> {
                 self.blas.linear_f32(xv, kv + (dims::KV_DIM * H * 2) as u64, b.v_proj, t, H, dims::KV_DIM, dims::KV_DIM)?;
             }
 
-            // D + E, per slice of up to 256 tokens (the local caches hold WINDOW + 256 positions): short conv,
+            // D + E, per slice (the local caches hold WINDOW + local_slice() positions): short conv,
             // clip and KV store of the slice (rings read only), then its attention, which sees every key
             // before it. The ring slots are written after the last slice.
             let k_ring = st.get(vs.k_ring).ptr;
@@ -637,8 +656,10 @@ impl<'a> WidePrefill<'a> {
             // Same values: queries never read later rows (causal mask), and the 2304-slot global ring still
             // holds every row from the chunk's first query - 1023 on.
             let fuse = global && gfuse() && (k.flash3.is_some() || k.flash4.is_some() || k.flash5.is_some() || (k.shadow && k.flash.is_some()));
-            for j0 in (0..t).step_by(SLICE) {
-                let tj = SLICE.min(t - j0);
+            // Local visits store and attend `local_slice()` tokens per launch; global ones 256 (fused below).
+            let slice = if global { SLICE } else { crate::state::local_slice() };
+            for j0 in (0..t).step_by(slice) {
+                let tj = slice.min(t - j0);
                 let mut a = Args::new();
                 a.push(b.qrgs).push(b.k_proj).push(b.v_proj);
                 if global {
@@ -689,7 +710,10 @@ impl<'a> WidePrefill<'a> {
                     self.go_smem(s, f5, (dims::KV_HEADS as u32, (tj / 16) as u32), 192, FLASH5_SMEM, a)?;
                     continue;
                 }
-                if let Some(f5) = k.flash5 {
+                // Local launches of 512 tokens or more also take flash5 (bit-identical to flash3): their 256+ CTAs
+                // fill the GPU two per SM. Below that flash3 is faster (128 CTAs, one per SM).
+                let local5 = k.flash5_any.filter(|_| !global && tj >= 512 && k.flash3.is_some() && !k.shadow);
+                if let Some(f5) = k.flash5.or(local5) {
                     let mut a = Args::new();
                     a.push(b.qrgs).push(b.rel16 + (l * 1024 * 16 * 2) as u64).push(k_cache).push(v_cache).push(vs.ring_cap as i32).push(window).push(d_pos);
                     a.push(if fp8 { NULL } else { b.attn_gated }).push(if fp8 { b.attn_gated_h } else { NULL }).push(j0 as i32);
@@ -813,7 +837,7 @@ impl<'a> WidePrefill<'a> {
                 a.push(PtrPack([b.mlp_in; 3])).push(b.saved).push(b.prior_last).push(PtrPack([cross_q + ((2 * loc + 1) * H * 4) as u64; 3]));
                 a.push(CtrlNvfp4([0, 1, 2].map(|i| [c[i]; 3]))).push(PtrPack([mlp_norm; 3])).push(PtrPack([b.mlp_normed; 3]));
                 a.push(PtrPack([b.mlp_normed_h, NULL, NULL]));
-                self.go(s, k.controller, (8 * tu, 1), 288, a)?;
+                self.go_ctrl(s, t, 1, a)?;
             }
 
             // I. Router and experts grouped by expert. The router runs the decode path's NVFP4 arithmetic (same
@@ -879,7 +903,11 @@ impl<'a> WidePrefill<'a> {
 
         // DSpark commit (f ring, draft context KV) for every position, as T / 8 B = 8 commits: each gets
         // its 8 tokens' taps and its start position in d_pos (restored to the chunk start afterwards).
-        if let Some(ds) = self.dspark {
+        if let Some(ds) = self.dspark.filter(|ds| ds.has_wide_commit()) {
+            // One commit for the chunk. `slots` is free after the last MLP post: [8 t][H] f32 holds the mix
+            // ([3 t][H]) and the K/V projections ([t][2 KV_DIM]).
+            ds.record_commit_wide(s, t, b.taps, b.slots, b.slots + (3 * t * H * 4) as u64)?;
+        } else if let Some(ds) = self.dspark {
             let dpos = st.get(st.s.d_pos).sub(0, 4);
             let dtaps = ds.taps();
             for j in 0..t / 8 {

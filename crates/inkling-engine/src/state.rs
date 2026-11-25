@@ -14,7 +14,26 @@ pub const RING_SLOTS: usize = 16;
 /// relative tail (1,024 + B) of decode, or the previous 1,023 rows plus a whole wide-prefill chunk (<= 1,024).
 /// Must equal the kernels' GLOBAL_KV_RING.
 pub const GLOBAL_KV_RING: usize = 2304;
+/// The smallest local KV cache (a 256-token slice); `local_kv_cap()` is the size in use.
 pub const LOCAL_KV_CAP: usize = dims::WINDOW + 256; // 1280
+
+/// Tokens the wide prefill stores and attends per local-attention launch (INKLING_LOCAL_SLICE: 256, 512 or
+/// 1024; default 512). The local KV caches hold WINDOW + this many positions, so a larger slice costs
+/// 40 visits x 2 x 2 KiB per extra position, in the state and in every saved checkpoint: 512 adds 42 MB to
+/// each over 256. With 512 the launch has 256 CTAs, which `prefill_attn_flash5` runs two per SM; measured
+/// 3 to 4% faster prefill than 256 (128 one-per-SM CTAs on 170 SMs), and 1024 was no faster than 512.
+pub fn local_slice() -> usize {
+    match std::env::var("INKLING_LOCAL_SLICE").ok().and_then(|v| v.parse().ok()) {
+        Some(256) => 256,
+        Some(1024) => 1024,
+        _ => 512,
+    }
+}
+
+/// Positions a local visit's KV cache holds.
+pub fn local_kv_cap() -> usize {
+    dims::WINDOW + local_slice()
+}
 /// With FP8 global KV (INKLING_KV_FP8), each global visit's BF16 cache is a ring of this many rows: the
 /// relative tail (1,024 + B) of decode, or the previous 1,023 rows plus a whole wide-prefill chunk (<= 1,024).
 /// Must equal the kernels' GLOBAL_KV_RING. const GLOBAL_KV_RING: usize = 2304;
@@ -30,7 +49,7 @@ pub const fn kv_fp8_bytes(kv_cap: usize) -> usize {
 }
 
 pub struct VisitState {
-    /// Positions the visit's KV store holds (global: max_ctx + B_MAX; local: LOCAL_KV_CAP).
+    /// Positions the visit's KV store holds (global: max_ctx + B_MAX; local: `local_kv_cap()`).
     pub kv_cap: usize,
     /// Slots of the BF16 k_cache/v_cache: kv_cap, or GLOBAL_KV_RING for a global visit with FP8 KV.
     pub ring_cap: usize,
@@ -113,7 +132,7 @@ impl State {
         let visits = SCHEDULE
             .iter()
             .map(|v| {
-                let kv_cap = if v.global { max_ctx + B_MAX } else { LOCAL_KV_CAP };
+                let kv_cap = if v.global { max_ctx + B_MAX } else { local_kv_cap() };
                 let i = v.index;
                 let ring_cap = if fp8 && v.global { GLOBAL_KV_RING } else { kv_cap };
                 VisitState {
@@ -146,7 +165,7 @@ impl State {
                 out.push(self.get(slot));
             }
             // Ring-indexed BF16 caches: the local windows, and the global rings when KV is FP8.
-            if v.kv_cap == LOCAL_KV_CAP || v.kv_fp8.is_some() {
+            if v.kv_cap == local_kv_cap() || v.kv_fp8.is_some() {
                 out.push(self.get(v.k_cache));
                 out.push(self.get(v.v_cache));
             }

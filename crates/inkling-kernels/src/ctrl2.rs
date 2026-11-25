@@ -386,6 +386,45 @@ pub unsafe fn mega_controller_nvfp4_cl8(
     }
 }
 
+/// `mega_controller_nvfp4_cl8` for the wide prefill: each cluster runs `tb` tokens one after another
+/// (tokens `cluster * tb ..`, below `t`) with the NVFP4 weights, query and post norm loaded into registers
+/// once, instead of once per token. Per token the code is `run`, so the outputs are bit-identical.
+/// Grid (8 * ceil(t / tb), n_streams), 288 threads.
+#[kernel]
+#[cluster_launch(8, 1, 1)]
+#[launch_bounds(288)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn prefill_controller_nvfp4_cl8(
+    xs: MutPtr3,
+    saved: *const f32,
+    prior_last: *const f32,
+    cp_queries: Ptr3,
+    cws: CtrlNvfp4Ptr3,
+    post_norms: Bf16Ptr3,
+    outs: MutPtr3,
+    outs_h: HalfPtr3,
+    tb: i32,
+    t: i32,
+) {
+    unsafe {
+        let m = cl8_smem!();
+        let rank = cluster::cluster_ctaidX() as usize;
+        let c0 = (blockIdx_x() as usize / G) * tb as usize;
+        let s = blockIdx_y() as usize;
+        let tid = threadIdx_x() as usize;
+        let pre = prefetch(&cp_queries, &cws, &post_norms, rank, s, tid);
+        let mut i = 0;
+        while i < tb as usize && c0 + i < t as usize {
+            let b = c0 + i;
+            let xb = pick3(xs.p, s).add(b * HIDDEN) as *const f32;
+            run(&m, &pre, xb, saved, prior_last, &cws, &outs, &outs_h, rank, b, s, tid);
+            // Every rank has read this token's partial sums before the next token overwrites them.
+            cluster::cluster_sync();
+            i += 1;
+        }
+    }
+}
+
 /// The depth attention without a norm (loop visits) for this thread's two float4s, with the block
 /// dot products already in `partials`; writes the output into `s_x` (and `out`, when non-null).
 /// Same arithmetic and reduction order as `mega::depth_attn_576` without a norm.

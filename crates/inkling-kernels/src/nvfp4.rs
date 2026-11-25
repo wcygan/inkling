@@ -434,6 +434,71 @@ linear_nvfp4_f32_kernel!(linear_nvfp4_f32_b2, 2);
 linear_nvfp4_f32_kernel!(linear_nvfp4_f32_b4, 4);
 linear_nvfp4_f32_kernel!(linear_nvfp4_f32_b8, 8);
 
+/// `linear_nvfp4_f32_kernel` for the wide prefill's DSpark commit: y[T, N] = x[T, K] W^T for `t` tokens, `tb`
+/// per CTA row (grid (ceil(N / 4), ceil(t / tb)), 128 threads). One warp per output row, as the B = 1..8
+/// kernels, with the row's weights decoded into registers once and reused for the CTA's tokens. Per (token,
+/// row) the products, their order and the reduction are those of `linear_nvfp4_f32_body`, so y is
+/// bit-identical. K <= 2560 (five 16-blocks per lane).
+#[kernel]
+#[launch_bounds(128)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn prefill_linear_nvfp4_f32(w_data: *const u8, w_scales: *const u8, global_scale: f32, x: *const f32, y: *mut f32, n: i32, k: i32, t: i32, tb: i32) {
+    unsafe {
+        let warp_i = (threadIdx_x() >> 5) as usize;
+        let lane = (threadIdx_x() & 31) as usize;
+        let row = blockIdx_x() as usize * 4 + warp_i;
+        if row >= n as usize {
+            return;
+        }
+        let (n, k) = (n as usize, k as usize);
+        let w_row = w_data.add(row * (k >> 1));
+        let s_row = w_scales.add(row * (k >> 4));
+        let n_blocks16 = k >> 4;
+        let mut lo = [[0u32; 4]; 5];
+        let mut hi = [[0u32; 4]; 5];
+        let mut sc = [0.0f32; 5];
+        let mut nb = 0;
+        while nb < 5 && lane + nb * 32 < n_blocks16 {
+            let blk = lane + nb * 32;
+            let w8 = crate::ldg_u2(w_row.add(blk * 8));
+            sc[nb] = cvt_e4m3_to_float(crate::ldg_u8(s_row.add(blk)));
+            lo[nb] = cvt_e2m1x8_to_half2x4(w8[0]);
+            hi[nb] = cvt_e2m1x8_to_half2x4(w8[1]);
+            nb += 1;
+        }
+        let b0 = blockIdx_y() as usize * tb as usize;
+        let mut i = 0;
+        while i < tb as usize && b0 + i < t as usize {
+            let b = b0 + i;
+            let mut acc = 0.0f32;
+            let mut j = 0;
+            while j < nb {
+                let xf = x.add(b * k + ((lane + j * 32) << 4));
+                let f0 = ldg_f4(xf);
+                let f1 = ldg_f4(xf.add(4));
+                let f2 = ldg_f4(xf.add(8));
+                let f3 = ldg_f4(xf.add(12));
+                let mut p0 = mul_f16x2(lo[j][0], pack_f16x2(f0[0], f0[1]));
+                let mut p1 = mul_f16x2(lo[j][1], pack_f16x2(f0[2], f0[3]));
+                p0 = fma_f16x2(lo[j][2], pack_f16x2(f1[0], f1[1]), p0);
+                p1 = fma_f16x2(lo[j][3], pack_f16x2(f1[2], f1[3]), p1);
+                p0 = fma_f16x2(hi[j][0], pack_f16x2(f2[0], f2[1]), p0);
+                p1 = fma_f16x2(hi[j][1], pack_f16x2(f2[2], f2[3]), p1);
+                p0 = fma_f16x2(hi[j][2], pack_f16x2(f3[0], f3[1]), p0);
+                p1 = fma_f16x2(hi[j][3], pack_f16x2(f3[2], f3[3]), p1);
+                let s = add_f16x2(p0, p1);
+                acc = fmaf(h2f_lo(s) + h2f_hi(s), sc[j], acc);
+                j += 1;
+            }
+            let s = mul_rn(warp_sum(acc), global_scale);
+            if lane == 0 {
+                *y.add(b * n + row) = s;
+            }
+            i += 1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fused NVFP4 cross-pass controller
 // ---------------------------------------------------------------------------
