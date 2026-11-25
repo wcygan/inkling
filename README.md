@@ -32,6 +32,16 @@ decoding on, one request at a time, greedy decoding.
 | 128K tokens | 330 tok/s | 6.7 ms |
 | 250K tokens | **278 tok/s** | 8.3 ms |
 
+```mermaid
+xychart-beta
+    title "Decode speed by context already in the cache (tokens per second)"
+    x-axis ["short", "32K", "64K", "128K", "250K"]
+    y-axis "tokens per second" 0 --> 600
+    line [550, 442, 390, 330, 278]
+```
+
+The slope is the cost of reading a longer cache at every step.
+
 **Prefill, from an empty cache**
 
 | Prompt | Time | Rate |
@@ -45,6 +55,19 @@ prefilled: a follow-up request that reused 80 of its 118 prompt tokens produced 
 **Memory:** 22.4 GiB at 256K context, with the 20 GB checkpoint loaded. Each saved cache state (for turn reuse) adds
 about 0.3 GB when used. The cache is allocated up front, so a smaller `max_ctx` uses less, by roughly 16 KiB for
 every token of context removed (an estimate).
+
+```mermaid
+pie showData
+    title GPU memory at 256K context, in GB (22.4 in total)
+    "Checkpoint weights, mostly NVFP4 experts" : 12.40
+    "Attention cache: FP8 KV, rings, scratch" : 4.69
+    "Packed NVFP4 copies: dense, head, router" : 2.94
+    "Wide prefill buffers" : 0.90
+    "Drafter: weights and state" : 0.87
+    "FP8 dense attention weights" : 0.65
+```
+
+The checkpoint is most of it. The attention cache is the FP8 KV cache plus the sliding-window rings and scratch; the server's startup log lists it as "other decode state".
 
 How to read these numbers:
 
@@ -65,6 +88,34 @@ How to read these numbers:
 ## Start here
 
 On a new machine the only thing to install by hand is `uv`. Everything else is checked for you:
+
+```mermaid
+flowchart LR
+  uv(["Install uv by hand: winget install astral-sh.uv"])
+  doctor{"doctor: is everything installed?"}
+  fix["Run the winget commands it prints, then open a new terminal"]
+  weights["just weights: download 20 GB, then verify it"]
+  kernels["just kernels: build the GPU kernels"]
+  build["just build: build the engine"]
+  serve["just serve: start the server"]
+  uv -- "run setup.cmd" --> doctor
+  doctor -- "no: lists what is missing" --> fix
+  fix -- "check again" --> doctor
+  doctor -- "yes" --> weights
+  weights -- "checkpoint verified" --> kernels
+  kernels -- "kernels fresh" --> build
+  build -- "engine built" --> serve
+  classDef inspect fill:#c3e0ff,stroke:#1680f3,color:#1c1c1c
+  classDef change fill:#bfe3df,stroke:#1a8a7d,color:#1c1c1c
+  classDef outside fill:#f0d3bf,stroke:#e8730c,color:#1c1c1c
+  class doctor inspect
+  class fix,weights,kernels,build,serve change
+  class uv outside
+```
+
+Blue boxes inspect or decide, green boxes do work, the purple cylinder is stored state, and orange boxes are outside the engine.
+
+In commands:
 
 ```powershell
 winget install --id astral-sh.uv -e
@@ -266,6 +317,62 @@ server: `INKLING_PORT`, `INKLING_CHECKPOINTS`, `INKLING_KV_FP8`, `INKLING_DRAFT_
 (turn wide prefill off), `INKLING_WIDE_MIN` (the shortest prompt that uses it, 256 tokens by default) and
 `INKLING_WIDE_MAX=1024` (smaller prefill chunks, which use less VRAM). `scripts\inkling.py serve` sets the first
 four from the settings above.
+
+## How it works
+
+One request, from the client to the streamed answer:
+
+```mermaid
+flowchart LR
+  client(["Client: Pi, curl, any OpenAI client"])
+  queue["Queue: 1 running, up to 4 waiting"]
+  reuse{"Does the prompt extend the cached conversation?"}
+  states[("Saved cache states: up to 6")]
+  prefill["Prefill the new tokens, in wide chunks from 256 tokens"]
+  decode["Decode: draft, verify, accept"]
+  client -- "POST /v1/chat/completions" --> queue
+  queue -- "next request runs" --> reuse
+  reuse -- "yes: keep the live cache" --> prefill
+  reuse -- "no: restore the nearest saved state" --> states
+  states -- "cache restored" --> prefill
+  prefill -- "saves a state at the end of the prompt" --> states
+  prefill -- "cache ready" --> decode
+  decode -- "streams text, reasoning and tool calls" --> client
+  classDef inspect fill:#c3e0ff,stroke:#1680f3,color:#1c1c1c
+  classDef change fill:#bfe3df,stroke:#1a8a7d,color:#1c1c1c
+  classDef record fill:#e3d5ff,stroke:#9b35d6,color:#1c1c1c
+  classDef outside fill:#f0d3bf,stroke:#e8730c,color:#1c1c1c
+  class queue,reuse inspect
+  class prefill,decode change
+  class states record
+  class client outside
+```
+
+Blue boxes inspect or decide, green boxes do work, the purple cylinder is stored state, and orange boxes are outside the engine.
+
+Decoding is speculative. A small drafter guesses several tokens ahead, and the full model checks all of the guesses in a single step, so a step that would give one token gives `k + 1`:
+
+```mermaid
+flowchart LR
+  draft["Drafter guesses the next tokens"]
+  verify["Model checks every guess in one step"]
+  accept{"How many guesses match what the model would pick?"}
+  commit["Keep the matches, plus the model's own next token"]
+  out(["Tokens streamed to the client"])
+  draft -- "1, 3 or 7 guesses, chosen by its confidence" --> verify
+  verify -- "scores all positions together" --> accept
+  accept -- "k match" --> commit
+  commit -- "k + 1 tokens from one step" --> out
+  commit -- "next step starts after them" --> draft
+  classDef inspect fill:#c3e0ff,stroke:#1680f3,color:#1c1c1c
+  classDef change fill:#bfe3df,stroke:#1a8a7d,color:#1c1c1c
+  classDef outside fill:#f0d3bf,stroke:#e8730c,color:#1c1c1c
+  class accept inspect
+  class draft,verify,commit change
+  class out outside
+```
+
+The result is the same as decoding one token at a time, except where two tokens are nearly tied (see the notes under [Performance](#performance)).
 
 ## Why it is specific to the RTX 5090
 
