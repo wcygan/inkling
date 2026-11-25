@@ -91,29 +91,11 @@ On a new machine the only thing to install by hand is `uv`. Everything else is c
 
 ```mermaid
 flowchart LR
-  uv(["Install uv by hand: winget install astral-sh.uv"])
-  doctor{"doctor: is everything installed?"}
-  fix["Run the winget commands it prints, then open a new terminal"]
-  weights["just weights: download 20 GB, then verify it"]
-  kernels["just kernels: build the GPU kernels"]
-  build["just build: build the engine"]
-  serve["just serve: start the server"]
-  uv -- "run setup.cmd" --> doctor
-  doctor -- "no: lists what is missing" --> fix
-  fix -- "check again" --> doctor
-  doctor -- "yes" --> weights
-  weights -- "checkpoint verified" --> kernels
-  kernels -- "kernels fresh" --> build
-  build -- "engine built" --> serve
-  classDef inspect fill:#c3e0ff,stroke:#1680f3,color:#1c1c1c
+  a["setup.cmd: check the tools"] --> b["just weights"] --> c["just kernels"] --> d["just build"] --> e["just serve"]
   classDef change fill:#bfe3df,stroke:#1a8a7d,color:#1c1c1c
   classDef outside fill:#f0d3bf,stroke:#e8730c,color:#1c1c1c
-  class doctor inspect
-  class fix,weights,kernels,build,serve change
-  class uv outside
+  class a,b,c,d,e change
 ```
-
-Blue boxes inspect or decide, green boxes do work, the purple cylinder is stored state, and orange boxes are outside the engine.
 
 In commands:
 
@@ -320,56 +302,28 @@ four from the settings above.
 
 ## How it works
 
-One request, from the client to the streamed answer:
+A request is a prefill, which reads the new part of the prompt, then a decode, which writes the answer. Turns that continue a conversation reuse the saved cache, so only the new tokens are prefilled:
 
 ```mermaid
 flowchart LR
-  client(["Client: Pi, curl, any OpenAI client"])
-  queue["Queue: 1 running, up to 4 waiting"]
-  reuse{"Does the prompt extend the cached conversation?"}
-  states[("Saved cache states: up to 6")]
-  prefill["Prefill the new tokens, in wide chunks from 256 tokens"]
-  decode["Decode: draft, verify, accept"]
-  client -- "POST /v1/chat/completions" --> queue
-  queue -- "next request runs" --> reuse
-  reuse -- "yes: keep the live cache" --> prefill
-  reuse -- "no: restore the nearest saved state" --> states
-  states -- "cache restored" --> prefill
-  prefill -- "saves a state at the end of the prompt" --> states
-  prefill -- "cache ready" --> decode
-  decode -- "streams text, reasoning and tool calls" --> client
-  classDef inspect fill:#c3e0ff,stroke:#1680f3,color:#1c1c1c
+  client(["Client"]) -- "request" --> prefill["Prefill: read the new prompt"]
+  prefill -- "cache ready" --> decode["Decode: write the answer"]
+  decode -- "streams tokens" --> client
   classDef change fill:#bfe3df,stroke:#1a8a7d,color:#1c1c1c
-  classDef record fill:#e3d5ff,stroke:#9b35d6,color:#1c1c1c
   classDef outside fill:#f0d3bf,stroke:#e8730c,color:#1c1c1c
-  class queue,reuse inspect
   class prefill,decode change
-  class states record
   class client outside
 ```
 
-Blue boxes inspect or decide, green boxes do work, the purple cylinder is stored state, and orange boxes are outside the engine.
-
-Decoding is speculative. A small drafter guesses several tokens ahead, and the full model checks all of the guesses in a single step, so a step that would give one token gives `k + 1`:
+Decoding is speculative. A small drafter guesses several tokens ahead, and the full model checks all of the guesses in a single step, so one step can give several tokens:
 
 ```mermaid
 flowchart LR
-  draft["Drafter guesses the next tokens"]
-  verify["Model checks every guess in one step"]
-  accept{"How many guesses match what the model would pick?"}
-  commit["Keep the matches, plus the model's own next token"]
-  out(["Tokens streamed to the client"])
-  draft -- "1, 3 or 7 guesses, chosen by its confidence" --> verify
-  verify -- "scores all positions together" --> accept
-  accept -- "k match" --> commit
-  commit -- "k + 1 tokens from one step" --> out
-  commit -- "next step starts after them" --> draft
-  classDef inspect fill:#c3e0ff,stroke:#1680f3,color:#1c1c1c
+  draft["Drafter guesses a few tokens"] -- "guesses" --> verify["Model checks them in one step"]
+  verify -- "keeps the matches, plus one more" --> draft
   classDef change fill:#bfe3df,stroke:#1a8a7d,color:#1c1c1c
   classDef outside fill:#f0d3bf,stroke:#e8730c,color:#1c1c1c
-  class accept inspect
-  class draft,verify,commit change
-  class out outside
+  class draft,verify change
 ```
 
 The result is the same as decoding one token at a time, except where two tokens are nearly tied (see the notes under [Performance](#performance)).
