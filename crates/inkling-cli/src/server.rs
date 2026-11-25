@@ -1392,7 +1392,7 @@ pub fn serve(o: &Opts) -> Result<(), String> {
         .visits
         .iter()
         .filter(|v| v.kv_cap > state.max_ctx)
-        .map(|v| state.get(v.k_cache).bytes + state.get(v.v_cache).bytes)
+        .map(|v| state.get(v.k_cache).bytes + state.get(v.v_cache).bytes + v.kv_fp8.map_or(0, |s| state.get(s).bytes))
         .sum();
     let parts = [
         ("checkpoint, resident (native NVFP4 experts 0-19, embed, small)", eng.weights.device_bytes().0),
@@ -1401,7 +1401,7 @@ pub fn serve(o: &Opts) -> Result<(), String> {
         ("drafter mtp, resident", dw.mtp.device_bytes().0),
         ("drafter packed", dw.arena.total_bytes()),
         ("drafter state", ds.total_bytes()),
-        ("global KV (max ctx)", global_kv),
+        ("global KV (max ctx, including the FP8 copy)", global_kv),
         ("other decode state (local KV, rings, scratch)", state.total_bytes() - global_kv),
         ("wide prefill buffers", eng_srv.wide.as_ref().map_or(0, |w| w.total_bytes())),
     ];
