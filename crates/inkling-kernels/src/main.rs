@@ -741,5 +741,6 @@ mod prefill_flash5;
 mod prefill_mega;
 mod prefill_moe;
 mod prefill_moe_mma;
+mod prefill_moe_bs;
 
 fn main() {}

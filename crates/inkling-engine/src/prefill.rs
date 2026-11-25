@@ -52,6 +52,8 @@ fn global_splits() -> i32 {
 }
 
 const MOE_MMA_SMEM: u32 = 2 * (128 + 64) * 128 * 2;
+/// Dynamic shared memory of `prefill_moe_{up,down}_bs` (`MOE_BS_SMEM`: two stages of 64 + 128 code rows and scales).
+const MOE_BS_SMEM: u32 = 2 * ((64 + 128) * 80 + (64 + 128) * 8);
 /// Visits whose updated hidden state feeds the drafter (forward.rs `TAP_VISITS`).
 const TAP_VISITS: [usize; 3] = [5, 23, 41];
 
@@ -128,6 +130,9 @@ struct K {
     /// Tiled grouped MoE (`prefill_moe_mma.rs`), only with INKLING_WIDE_MOE=mma: at T <= 1024 the
     /// decode-structured grouped kernels (`prefill_moe.rs`) measured faster (2K 0.37 vs 0.46 s, 8K 1.28 vs 1.46 s).
     moe_mma: Option<[Kernel; 3]>,
+    /// Block-scaled FP4 tensor-core MoE (`prefill_moe_bs.rs`: tiles, activation quantizer, up, down), only with
+    /// INKLING_WIDE_MOE=bs: it quantizes the activations to NVFP4, so it changes the arithmetic.
+    moe_bs: Option<[Kernel; 4]>,
     /// `prefill_route_logits_nvfp4` (the decode router's arithmetic), unless INKLING_WIDE_ROUTER=bf16.
     router8: Option<Kernel>,
 }
@@ -169,6 +174,9 @@ struct Bufs {
     rel16: u64,
     shadow_h: u64,
     counters: u64,
+    /// NVFP4 activations of the block-scaled MoE: codes ([8 t][INTERMEDIATE / 2] bytes at most) and scales.
+    qa_codes: u64,
+    qa_scales: u64,
 }
 
 pub struct WidePrefill<'a> {
@@ -302,6 +310,8 @@ impl<'a> WidePrefill<'a> {
             o_fp8: (|| Some([m.function("linear_fp8_prefill_k3072_mt1")?, m.function("linear_fp8_prefill_k3072_mt2")?, m.function("linear_fp8_prefill_k3072_mt4")?]))(),
             moe_mma: (|| Some([m.function("prefill_moe_tiles")?, m.function("prefill_moe_up_mma")?, m.function("prefill_moe_down_mma")?]))()
                 .filter(|_| std::env::var("INKLING_WIDE_MOE").is_ok_and(|v| v == "mma")),
+            moe_bs: (|| Some([m.function("prefill_moe_tiles")?, m.function("prefill_quant_f16_to_nvfp4")?, m.function("prefill_moe_up_bs")?, m.function("prefill_moe_down_bs")?]))()
+                .filter(|_| std::env::var("INKLING_WIDE_MOE").is_ok_and(|v| v == "bs")),
             router8: m.function("prefill_route_logits_nvfp4").filter(|_| fwd.parts.router && std::env::var("INKLING_WIDE_ROUTER").map_or(true, |v| v != "bf16")),
             flash2: (|| Some([m.function("prefill_attn_flash2")?, m.function("prefill_attn_merge2")?]))()
                 .filter(|_| std::env::var("INKLING_WIDE_FLASH").is_ok_and(|v| v == "2")),
@@ -334,6 +344,10 @@ impl<'a> WidePrefill<'a> {
         }
         if let Some(f4) = m.function("prefill_attn_flash4") {
             f4.set_max_dynamic_shared(FLASH4_SMEM).map_err(|e| e.to_string())?;
+        }
+        if let Some([_, _, ku, kd]) = k.moe_bs {
+            ku.set_max_dynamic_shared(MOE_BS_SMEM).map_err(|e| e.to_string())?;
+            kd.set_max_dynamic_shared(MOE_BS_SMEM).map_err(|e| e.to_string())?;
         }
         if let Some([_, ku, kd]) = k.moe_mma {
             ku.set_max_dynamic_shared(MOE_MMA_SMEM).map_err(|e| e.to_string())?;
@@ -380,6 +394,8 @@ impl<'a> WidePrefill<'a> {
         let s_shadow = p.reserve_of::<u16>("shadow_h", t * dims::Q_DIM);
         let s_counters = p.reserve_of::<u32>("shadow_counters", 4);
         let s_part = p.reserve_of::<f32>("attn_part", 2 * 1024 * dims::HEADS * 16 + 1024 * dims::HEADS * MAX_SPLITS * dims::HEAD_DIM);
+        let s_qc = p.reserve_aligned("qa_codes", if k.moe_bs.is_some() { t * dims::TOP_K * dims::INTERMEDIATE / 2 } else { 16 }, 256);
+        let s_qs = p.reserve_aligned("qa_scales", if k.moe_bs.is_some() { t * dims::TOP_K * dims::INTERMEDIATE / 16 } else { 16 }, 256);
         let s_ws = p.reserve_aligned("cublas_ws", WORKSPACE, 256);
         let arena = p.allocate().map_err(|e| e.to_string())?;
         let g = |s| ptr::<u8>(&arena, s);
@@ -419,6 +435,8 @@ impl<'a> WidePrefill<'a> {
             rel16: g(s_rel16),
             shadow_h: g(s_shadow),
             counters: g(s_counters),
+            qa_codes: g(s_qc),
+            qa_scales: g(s_qs),
         };
         if let Some(kr) = k.rel16_k {
             for l in 0..dims::LAYERS {
@@ -857,7 +875,25 @@ impl<'a> WidePrefill<'a> {
             a.push(b.route_ids).push((t * dims::TOP_K) as i32).push(b.offs).push(b.pairs);
             self.go(s, k.moe_group, (1, 1), 1024, a)?;
             let e = &lq.experts;
-            if let Some([kt, ku, kd]) = k.moe_mma {
+            if let Some([kt, kq, ku, kd]) = k.moe_bs {
+                let max_tiles = (t * dims::TOP_K / 64 + dims::EXPERTS) as u32;
+                let mut a = Args::new();
+                a.push(b.offs).push(b.tiles).push(b.tiles_n);
+                self.go(s, kt, (1, 1), 32, a)?;
+                let quant = |src: u64, values: usize| -> Result<(), String> {
+                    let mut a = Args::new();
+                    a.push(src).push(b.qa_codes).push(b.qa_scales).push((values / 16) as i32);
+                    self.go(s, kq, ((values / 16).div_ceil(256) as u32, 1), 256, a)
+                };
+                quant(b.mlp_normed_h, t * H)?;
+                let mut a = Args::new();
+                a.push(b.qa_codes).push(b.qa_scales).push(b.offs).push(b.pairs).push(b.tiles).push(b.tiles_n).push(e.w13.ptr).push(e.w13_scales.ptr).push(e.w13_factor.ptr).push(b.act);
+                self.go_smem(s, ku, ((2 * dims::INTERMEDIATE / 128) as u32, max_tiles), 256, MOE_BS_SMEM, a)?;
+                quant(b.act, t * dims::TOP_K * dims::INTERMEDIATE)?;
+                let mut a = Args::new();
+                a.push(b.qa_codes).push(b.qa_scales).push(b.offs).push(b.pairs).push(b.tiles).push(b.tiles_n).push(b.route_w).push(e.w2.ptr).push(e.w2_scales.ptr).push(e.w2_factor.ptr).push(b.slots);
+                self.go_smem(s, kd, ((H / 128) as u32, max_tiles), 256, MOE_BS_SMEM, a)?;
+            } else if let Some([kt, ku, kd]) = k.moe_mma {
                 let max_tiles = (t * dims::TOP_K / 64 + dims::EXPERTS) as u32;
                 let mut a = Args::new();
                 a.push(b.offs).push(b.tiles).push(b.tiles_n);
