@@ -44,12 +44,18 @@ The slope is the cost of reading a longer cache at every step.
 
 **Prefill, from an empty cache**
 
-Prefill is the time to read the prompt before the first token appears. It grows with prompt length, so these times are for a prompt that fills the window. A short prompt takes a fraction of a second, and a prompt of about 10K tokens takes a few seconds at the same rate.
+Prefill is the time to read the prompt before the first token appears. It grows with prompt length, so the 256K time is for a prompt that fills the window. A short prompt takes a fraction of a second, and a 10K-token prompt takes about a second and a half.
 
 | Prompt | Time | Rate |
 | --- | ---: | ---: |
+| 1K tokens | 0.21 to 0.23 s | about 4,500 tok/s |
+| 10K tokens | 1.4 to 1.5 s | about 7,000 tok/s |
+| 32K tokens | 4.6 to 4.7 s | about 6,900 tok/s |
+| 64K tokens | 10.0 to 10.2 s | about 6,300 tok/s |
 | 128K tokens | 23.4 to 23.7 s | about 5,600 tok/s |
 | 256K tokens | 64.1 to 65.6 s | about 4,000 tok/s |
+
+The 1K to 64K rows were timed through the HTTP server on the final build: three runs each, random-word prompts that cannot reuse the cache, one output token, so each time includes about one decode step. The 128K and 256K rows are from earlier in-engine runs. The rate falls at long context because attention reads a longer cache.
 
 Later turns of a conversation do not pay this again. The server keeps the cache, so only the new tokens are
 prefilled: a follow-up request that reused 80 of its 118 prompt tokens produced its first token in about 70 ms.
