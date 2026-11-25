@@ -13,7 +13,7 @@ https://github.com/satellitedown/inkling-2-mini-abliterated-ingine
   verify width with a CUDA-graph switch, and the grouped MoE prefill pipeline. assets/draft_vocab_32k.bin is
   built from ingine's draft_shortlist.bin (see scripts/build_draft_vocab.py).
 
-tensorfish/squid5090 (copyright 2026 tensorfish)
+tensorfish/squid5090 (Apache License 2.0, copyright 2026 tensorfish)
 https://github.com/tensorfish/squid5090
   The Zig/CUDA engine whose kernel designs, launch order and parameter lists the Rust and cuda-oxide kernels in
   crates/inkling-kernels and the launch code in crates/inkling-engine were ported from.
