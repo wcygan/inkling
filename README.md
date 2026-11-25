@@ -2,15 +2,65 @@
 
 A native Windows inference engine and OpenAI-compatible server for [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini),
 written in Rust with GPU kernels in Rust ([cuda-oxide](https://github.com/NVIDIA/cuda-rust)). It is built for one
-GPU, the **NVIDIA RTX 5090** (Blackwell, `sm_120a`), and runs the model with:
+GPU, the **NVIDIA RTX 5090** (Blackwell, `sm_120a`), and for **long context**: with the full **256K-token** window
+in use, it decodes at about **278 tokens/s**, prefills a 256K prompt in about **65 seconds**, and fits in about
+**22.5 GiB** of the card's 32 GB. At short context it decodes at about 550 tokens/s.
+
+It gets there with:
 
 * **FP8 dense attention and NVFP4 experts**, so the 20 GB checkpoint fits next to a long context in 32 GB;
+* an **FP8 KV cache** (and an FP8 cache for the drafter), which is what makes 256K fit and keeps long-context decoding
+  fast, because decoding is limited by how many bytes of cache each step reads;
 * **DSpark speculative decoding** with an adaptive verify width (2, 4 or 8 tokens per step);
-* **Wide prefill**, a batched prompt path for long prompts, with chunks up to 2,048 tokens;
-* an **FP8 KV cache**, which makes a context of up to **256K tokens** fit in about 22.5 GiB.
+* **Wide prefill**, a batched prompt path for long prompts, with chunks up to 2,048 tokens.
 
 `inkling serve` speaks the OpenAI chat API (streaming, reasoning, tool calls) and reuses the cache across turns,
 so it works as the backend for coding agents such as [Pi](https://www.npmjs.com/package/@mariozechner/pi-coding-agent).
+
+## Performance
+
+Measured on one RTX 5090 (32 GB), Windows 11, CUDA 13.5, with the FP8 KV and drafter caches and speculative
+decoding on, one request at a time, greedy decoding.
+
+**Decoding speed, by how much context is already in the cache**
+
+| Context | Decode speed | Time per step |
+| --- | ---: | ---: |
+| short (about 100 tokens) | about 550 tok/s | 5.5 ms |
+| 32K tokens | 442 tok/s | 5.7 ms |
+| 64K tokens | 390 tok/s | 6.0 ms |
+| 128K tokens | 330 tok/s | 6.7 ms |
+| 250K tokens | **278 tok/s** | 8.3 ms |
+
+**Prefill, from an empty cache**
+
+| Prompt | Time | Rate |
+| --- | ---: | ---: |
+| 128K tokens | 23.4 to 23.7 s | about 5,600 tok/s |
+| 256K tokens | 64.1 to 65.6 s | about 4,000 tok/s |
+
+Later turns of a conversation do not pay this again. The server keeps the cache, so only the new tokens are
+prefilled: a follow-up request that reused 80 of its 118 prompt tokens produced its first token in about 70 ms.
+
+**Memory:** 22.4 GiB at 256K context, with the 20 GB checkpoint loaded. Each saved cache state (for turn reuse) adds
+about 0.3 GB when used. The cache is allocated up front, so a smaller `max_ctx` uses less, by roughly 16 KiB for
+every token of context removed (an estimate).
+
+How to read these numbers:
+
+* The decode rows are greedy decoding of 256 tokens after a prompt of that length, from repeated runs that alternate
+  between builds so that drift does not bias them, with the GPU otherwise idle. Speed falls with context because each step reads the whole cache:
+  at 250K the attention reads already run at roughly 90 to 96% of the card's memory bandwidth, so going faster needs
+  fewer bytes, not faster kernels.
+* Speculative decoding runs faster on predictable text. These prompts accepted about 2.3 tokens per step, which is a
+  cautious case. Code and tool calls accept about 5 and ran at 520 to 660 tok/s in short-context requests I tried,
+  and copy-like text runs faster still.
+* FP8 caches trade a little numeric precision for the memory and speed. The output matches the reference model
+  within the tolerances I checked, but past about 8K tokens the speculative output can differ from plain greedy
+  decoding where two tokens are nearly tied.
+* The decode rows were measured on a build slightly older than this code. Two later changes made decoding about
+  1 to 2% faster, so they are if anything a little low. You can check short-context speed on your own machine with
+  `target\release\inkling.exe bench`.
 
 ## Start here
 
