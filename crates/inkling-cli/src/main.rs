@@ -13,10 +13,13 @@
 //!       ingine-bench's chat and code prompts. Prefill replays the captured step graph once per prompt
 //!       token (INKLING_EAGER_PREFILL=1 runs it eagerly instead); decode replays it once per token with a
 //!       host sync per token, as a streaming server does. Default effort low.
+//!   inkling kld FILE [PREFIX] [EVAL]
+//!       KL divergence of the shipped fp8 mode (token and wide prefill) from exact mode, see kld.rs.
 //!   inkling serve --mode fp8 --draft-vocab FILE [--max-ctx N] [--effort E]
 //!       OpenAI-compatible chat server on 127.0.0.1:$INKLING_PORT (default 8013), see server.rs.
 
 mod engine;
+mod kld;
 mod lookup;
 mod server;
 mod spec;
@@ -354,7 +357,7 @@ fn bench_cmd(o: &Opts) -> Result<(), String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((cmd, rest)) = args.split_first() else {
-        eprintln!("usage: inkling <load-check|tokenize|generate|bench|serve> [options]");
+        eprintln!("usage: inkling <load-check|tokenize|generate|bench|kld|serve> [options]");
         return ExitCode::from(2);
     };
     let result = parse(rest).and_then(|o| match cmd.as_str() {
@@ -362,6 +365,7 @@ fn main() -> ExitCode {
         "tokenize" => tokenize(&o),
         "generate" => generate_cmd(&o),
         "bench" => bench_cmd(&o),
+        "kld" => kld::kld_cmd(&o),
         "serve" => server::serve(&o),
         other => Err(format!("unknown command {other}")),
     });
