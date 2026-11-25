@@ -115,6 +115,8 @@ pub struct Kernels {
     tail_attn: Kernel,
     merge: Kernel,
     route_logits: Kernel,
+    // Loaded with the module but no longer launched: `route_select_fast` replaces them.
+    #[allow(dead_code)]
     route_select: Kernel,
     moe_up: [Kernel; 2],
     moe_down: [Kernel; 2],
@@ -145,6 +147,7 @@ pub struct Kernels {
     bulk_fp8: [Kernel; 4],
     tail_attn_b: [Kernel; 3],
     route_logits_nvfp4_b: [Kernel; 3],
+    #[allow(dead_code)]
     route_select_b: [Kernel; 3],
     /// small-ops (`router.rs`): the redux top-8 select, bit-identical to `route_select_b`.
     route_select_fast: [Kernel; 4],

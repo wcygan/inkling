@@ -131,6 +131,11 @@ class Paths:
         return self.root / "target" / "release" / "inkling.exe"
 
     @property
+    def serve_exe(self) -> Path:
+        """The server runs from a copy, so Windows never locks the build output and `build` works while it runs."""
+        return self.root / "target" / "release" / "inkling-serve.exe"
+
+    @property
     def oxide(self) -> Path:
         return self.root / "third_party" / "cuda-rust"
 
@@ -632,10 +637,10 @@ def _powershell_json(script: str):
 
 def our_servers(paths: Paths) -> list[dict]:
     """Running `inkling.exe serve` processes of this repository (other copies of inkling are left alone)."""
-    rows = _powershell_json("Get-CimInstance Win32_Process -Filter \"Name='inkling.exe'\" | "
+    rows = _powershell_json("Get-CimInstance Win32_Process -Filter \"Name='inkling.exe' OR Name='inkling-serve.exe'\" | "
                             "Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress")
-    mine = os.path.normcase(str(paths.exe.resolve()))
-    return [r for r in rows if r.get("ExecutablePath") and os.path.normcase(r["ExecutablePath"]) == mine
+    mine = {os.path.normcase(str(p.resolve())) for p in (paths.exe, paths.serve_exe)}
+    return [r for r in rows if r.get("ExecutablePath") and os.path.normcase(r["ExecutablePath"]) in mine
             and re.search(r"\sserve(\s|$)", r.get("CommandLine") or "")]
 
 
@@ -851,13 +856,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_weights(args: argparse.Namespace) -> int:
     s = load_settings(P, args)
     with command_lock(P, "weights"):
-        if our_servers(P):
-            raise Refused("a server is running; stop it first (`inkling stop`) so the files are not changed under it")
         state, _ = weights_state(P, s.model_dir)
         if state == "verified" and not args.force:
             say("The checkpoint is already downloaded and verified. Use --force to download it again.")
             return 0
         if state in ("absent", "partial") or args.force:
+            if our_servers(P):  # only a download rewrites files; checking them is safe while a server runs
+                raise Refused("a server is running; stop it first (`inkling stop`) so the files are not changed under it")
             refuse_if_missing(P, "weights", s.model_dir)
             uv = shutil.which("uv")
             if not uv:
@@ -912,11 +917,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         why = serve_checks(P, s, args.unverified_weights)
         if why:
             raise Refused(why)
-        warn = vram_warning(s)
-        if warn:
-            say(f"Warning: {warn}")
         build_host(P)
-        argv = [str(P.exe), "serve", "--mode", "fp8", "--draft-vocab", str(P.vocab), "--max-ctx", str(s.max_ctx),
+        argv = [str(P.serve_exe), "serve", "--mode", "fp8", "--draft-vocab", str(P.vocab), "--max-ctx", str(s.max_ctx),
                 "--effort", s.effort, "--model-dir", str(s.model_dir)]
         env = dict(os.environ, INKLING_PORT=str(s.port), INKLING_CHECKPOINTS=str(s.checkpoints),
                    INKLING_SERVE_LOG=str(P.logs / "serve-log.jsonl"))
@@ -928,13 +930,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if on:
                 env[name] = "1"
         if args.dry_run:
+            warn = None if our_servers(P) else vram_warning(s)  # a running server's memory is freed by the replacement
+            if warn:
+                say(f"Warning: {warn}")
             say("Dry run: everything checks out. Would stop this repository's server if one is running, then start:")
             say("  " + " ".join(argv))
             return 0
         stop_servers(P, s.port)
+        shutil.copyfile(P.exe, P.serve_exe)  # after the old server stopped, so the copy is not locked
         why = serve_checks(P, s, args.unverified_weights)  # again, right before the start
         if why:
             raise Refused(["the checks changed while the old server was stopping:"] + why)
+        warn = vram_warning(s)  # now that the old server has released its memory
+        if warn:
+            say(f"Warning: {warn}")
         if s.pi_models_json:
             sync_pi(s.pi_models_json, s.port, s.max_ctx)
         step(f"starting the server (max_ctx {s.max_ctx:,}, port {s.port})")
@@ -950,7 +959,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         lock.release()  # loading is done; other commands may run now
         say(f"Server ready: http://127.0.0.1:{s.port}/v1  (model inkling-2-mini). Ctrl+C stops it.")
         try:
-            return proc.wait()
+            code = proc.wait()
+            if code == 1:  # what Windows reports for a process that was force-stopped
+                say("The server was stopped (from another terminal, or replaced by a newer `serve`).")
+                return 0
+            return code
         except KeyboardInterrupt:
             proc.terminate()
             with contextlib.suppress(subprocess.TimeoutExpired):
