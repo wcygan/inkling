@@ -1,0 +1,4 @@
+# cuda-oxide at 5e5c77b pins Rust 1.99.1 with these components.
+[toolchain]
+channel = "1.99.1"
+components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "rustfmt", "llvm-tools"]

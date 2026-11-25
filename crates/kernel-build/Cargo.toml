@@ -1,0 +1,25 @@
+[package]
+name = "kernel-build"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Build driver for the cuda-oxide device kernels in ../inkling-kernels"
+
+# `cargo oxide build --arch sm_120a`, run from this directory, compiles ../inkling-kernels and
+# writes kernels/inkling_kernels.cubin here (copy it to the repository's kernels/ folder).
+[[package.metadata.cuda-oxide.device-crates]]
+manifest-path = "../inkling-kernels/Cargo.toml"
+artifact-dir = "kernels"
+artifact-name = "inkling_kernels"
+artifact-kind = "cubin"
+source-identity = true
+bin = "inkling-kernels"
+
+[dependencies]
+
+[workspace]
+resolver = "2"
+
+[profile.release]
+debug = "line-tables-only"

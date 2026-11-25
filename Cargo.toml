@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+# inkling-kernels is device code: cargo-oxide builds it separately with the
+# rustc-codegen-cuda backend (crates/kernel-build declares it as a metadata device crate),
+# so it stays out of the host workspace build.
+members = [
+    "crates/inkling-runtime",
+    "crates/inkling-model",
+    "crates/inkling-text",
+    "crates/inkling-cli",
+    "crates/inkling-engine",
+]
+# kernel-build is its own workspace, so `cargo oxide build` runs there without touching this file.
+exclude = ["crates/inkling-kernels", "crates/kernel-build", "third_party"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[profile.release]
+debug = "line-tables-only"

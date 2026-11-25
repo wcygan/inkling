@@ -1,0 +1,16 @@
+# Build outputs and local state
+target/
+logs/
+crates/kernel-build/target/
+crates/kernel-build/kernels/
+
+# Built GPU kernels (`just kernels` creates them)
+kernels/*
+!kernels/README.md
+
+# Upstream clones that the kernel build needs (see README); fetch them yourself
+third_party/
+
+# Model weights stay out of source control
+*.safetensors
+Models/

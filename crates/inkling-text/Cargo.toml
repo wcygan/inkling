@@ -1,0 +1,12 @@
+[package]
+name = "inkling-text"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Inkling-2-Mini text front end for inkling-rs: HF tokenizer and the model's own chat template"
+
+[dependencies]
+minijinja = { version = "2", features = ["loop_controls"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }

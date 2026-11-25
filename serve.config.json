@@ -1,0 +1,10 @@
+{
+  "max_ctx": 262144,
+  "checkpoints": 6,
+  "effort": "low",
+  "port": 8013,
+  "kv_fp8": true,
+  "draft_kv_fp8": true,
+  "model_dir": "",
+  "pi_models_json": ""
+}

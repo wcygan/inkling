@@ -1,0 +1,18 @@
+[package]
+name = "inkling-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "inkling-rs command line: load-check, tokenize (generate, parity and bench follow with the engine)"
+
+[[bin]]
+name = "inkling"
+path = "src/main.rs"
+
+[dependencies]
+inkling-model = { path = "../inkling-model" }
+inkling-runtime = { path = "../inkling-runtime" }
+inkling-engine = { path = "../inkling-engine" }
+inkling-text = { path = "../inkling-text" }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }

@@ -1,0 +1,11 @@
+[package]
+name = "inkling-engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "inkling-rs decode engine: runtime state and the per-token forward recorder"
+
+[dependencies]
+inkling-model = { path = "../inkling-model" }
+inkling-runtime = { path = "../inkling-runtime" }

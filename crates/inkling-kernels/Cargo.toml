@@ -1,0 +1,22 @@
+[package]
+name = "inkling-kernels"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Inkling-2-Mini device kernels written in cuda-oxide (ports of squid5090 kernels)"
+publish = false
+
+# cargo-oxide builds this crate with the rustc-codegen-cuda backend and
+# finalizes the kernels into `inkling_kernels.cubin` (libNVVM + nvJitLink).
+# k0-bench declares it as a metadata device crate and loads the cubin through
+# the driver API, next to the nvcc cubin of squid5090's own source.
+[[bin]]
+name = "inkling-kernels"
+path = "src/main.rs"
+
+[dependencies]
+cuda-device = { path = "../../third_party/cuda-rust/cuda-oxide/crates/cuda-device" }
+cuda-host = { path = "../../third_party/cuda-rust/cuda-oxide/crates/cuda-host" }
+cuda-core = { path = "../../third_party/cuda-rust/cuda-core" }
+[workspace]
+resolver = "2"

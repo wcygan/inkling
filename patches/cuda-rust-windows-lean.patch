@@ -1,0 +1,40 @@
+diff --git a/cuda-oxide/crates/lean-exporter/src/runner.rs b/cuda-oxide/crates/lean-exporter/src/runner.rs
+index 19c57397b..243d456aa 100644
+--- a/cuda-oxide/crates/lean-exporter/src/runner.rs
++++ b/cuda-oxide/crates/lean-exporter/src/runner.rs
+@@ -160,7 +160,7 @@ pub fn default_lean_package_dir() -> PathBuf {
+ fn find_lake_executable() -> Result<PathBuf, ExportError> {
+     if let Some(paths) = env::var_os("PATH") {
+         for dir in env::split_paths(&paths) {
+-            let candidate = dir.join("lake");
++            let candidate = dir.join(format!("lake{}", env::consts::EXE_SUFFIX));
+             if candidate.is_file() {
+                 return Ok(candidate);
+             }
+@@ -169,13 +169,16 @@ fn find_lake_executable() -> Result<PathBuf, ExportError> {
+     let home = env::var_os("ELAN_HOME")
+         .map(PathBuf::from)
+         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".elan")))
++        .or_else(|| env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".elan")))
+         .ok_or_else(|| {
+             reject(
+                 "lean verifier",
+                 "could not locate `lake` on PATH or in ~/.elan/bin",
+             )
+         })?;
+-    let candidate = home.join("bin").join("lake");
++    let candidate = home
++        .join("bin")
++        .join(format!("lake{}", env::consts::EXE_SUFFIX));
+     if candidate.is_file() {
+         Ok(candidate)
+     } else {
+@@ -219,7 +222,7 @@ pub fn check_generated_lean_in_cache(
+     cache_dir: Option<&Path>,
+ ) -> Result<(), ExportError> {
+     let lake = find_lake_executable()?;
+-    let lean_bin = lake.with_file_name("lean");
++    let lean_bin = lake.with_file_name(format!("lean{}", env::consts::EXE_SUFFIX));
+     let olean_dir = lean_package_dir.join(".lake/build/lib/lean");
+     let use_direct_lean = lean_bin.is_file() && olean_dir.join("CudaOxide.olean").is_file();
+ 
