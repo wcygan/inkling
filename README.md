@@ -3,7 +3,7 @@
 A native Windows inference engine and OpenAI-compatible server for [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini),
 written in Rust with GPU kernels in Rust ([cuda-oxide](https://github.com/NVIDIA/cuda-rust)). It is built for one
 GPU, the **NVIDIA RTX 5090** (Blackwell, `sm_120a`), and for **long context**: with the full **256K-token** window
-in use, it decodes at about **278 tokens/s**, prefills a 256K prompt in about **65 seconds**, and fits in about
+in use, it decodes at about **278 tokens/s**, reads a completely full 256K-token prompt (about a 600-page book) in about **65 seconds**, and fits in about
 **22.5 GiB** of the card's 32 GB. At short context it decodes at about 550 tokens/s.
 
 It gets there with:
@@ -43,6 +43,8 @@ xychart-beta
 The slope is the cost of reading a longer cache at every step.
 
 **Prefill, from an empty cache**
+
+Prefill is the time to read the prompt before the first token appears. It grows with prompt length, so these times are for a prompt that fills the window. A short prompt takes a fraction of a second, and a prompt of about 10K tokens takes a few seconds at the same rate.
 
 | Prompt | Time | Rate |
 | --- | ---: | ---: |
