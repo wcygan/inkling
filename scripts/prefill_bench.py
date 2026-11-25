@@ -7,6 +7,8 @@
 
     uv run --script scripts/prefill_bench.py run LABEL [--exe FILE] [--cubin FILE] [--quick] [KEY=VALUE ...]
     uv run --script scripts/prefill_bench.py cmp BASE LABEL
+    uv run --script scripts/prefill_bench.py run LABEL --speed 1000:3,10000:3,32000:3,64000:3,128000:3,256000:3
+    uv run --script scripts/prefill_bench.py run LABEL --small
 
 `run` starts `inkling serve` with the shipped settings (fp8, FP8 KV caches, 256K context) and writes
 logs/prefill-bench/LABEL.json:
@@ -17,7 +19,10 @@ logs/prefill-bench/LABEL.json:
 must give the same text; one that does not shows up here as the first prompt whose output differs.
 
 The repository's own server must be stopped first (the GPU holds one copy of the model). KEY=VALUE pairs are
-environment variables for the server (for example INKLING_WIDE_MOE=mma).
+environment variables for the server (for example INKLING_WIDE_MOE=mma). `--speed TOKENS:RUNS,...` measures only
+cold prefill at those prompt sizes (the README's table) and skips the outputs. `--small` measures follow-up turns
+instead: one conversation that starts at about 8K tokens and adds 16 to 700 new tokens per turn (five rounds), with
+the time to the first token and the reply text of every turn.
 """
 import json
 import os
@@ -93,9 +98,9 @@ class Server:
                     raise SystemExit(f"the server did not become ready; see {self.console.name}")
                 time.sleep(1)
 
-    def chat(self, messages: list, max_tokens: int) -> tuple[str, dict]:
+    def chat(self, messages: list, max_tokens: int, effort: str = "low") -> tuple[str, dict]:
         body = {"model": "inkling-2-mini", "messages": messages, "max_tokens": max_tokens, "temperature": 0,
-                "reasoning_effort": "low"}
+                "reasoning_effort": effort}
         req = urllib.request.Request(BASE + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
         reply = json.load(urllib.request.urlopen(req, timeout=900))
         msg = reply["choices"][0]["message"]
@@ -117,22 +122,50 @@ class Server:
         self.console.close()
 
 
-def run(label: str, exe: Path, cubin: Path | None, quick: bool, extra: dict[str, str]) -> None:
+SMALL_SIZES = [16, 40, 80, 150, 230, 400, 700]
+
+
+def small_turns(srv: "Server", text: str, result: dict) -> None:
+    """One growing conversation: each turn adds a user message of about SMALL_SIZES[i] tokens. No reasoning, so
+    every reply has content and the next request extends the live cache."""
+    msgs = [{"role": "user", "content": source_prompt(text, 8000, 21)}]
+    out, _ = srv.chat(msgs, 24, "none")
+    msgs.append({"role": "assistant", "content": out.split("", 1)[1] or "ok"})
+    seed = 500
+    for rnd in range(5):
+        for size in SMALL_SIZES:
+            seed += 1
+            msgs.append({"role": "user", "content": word_prompt(size, seed) + " Reply with one short sentence."})
+            out, row = srv.chat(msgs, 24, "none")
+            reply = out.split("", 1)[1]
+            msgs.append({"role": "assistant", "content": reply or "ok"})
+            result["small"].append({"size": size, "round": rnd, "prefilled": row["prefilled"], "reuse": row["reuse"],
+                                    "seconds": row["ttft_s"], "prompt": row["prompt"], "text": reply})
+        last = result["small"][-len(SMALL_SIZES):]
+        print(f"  small round {rnd}: " + ", ".join(f"{r['prefilled']} tok {r['seconds'] * 1e3:.0f} ms ({r['reuse']})" for r in last), flush=True)
+
+
+def run(label: str, exe: Path, cubin: Path | None, quick: bool, extra: dict[str, str], speed: list[tuple[int, int]] | None = None,
+        small: bool = False) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     text = corpus()
     srv = Server(label, exe, cubin, extra)
-    result = {"label": label, "exe": str(exe), "cubin": str(cubin) if cubin else None, "env": extra, "speed": [], "outputs": []}
+    result = {"label": label, "exe": str(exe), "cubin": str(cubin) if cubin else None, "env": extra, "speed": [], "outputs": [], "small": []}
     try:
         srv.chat([{"role": "user", "content": word_prompt(3000, 1)}], 1)  # warm-up
+        if small:
+            small_turns(srv, text, result)
+            speed = []
         seed = 100
-        for name, tokens, reps in (("19K", 19000, 5), ("64K", 64000, 3), ("128K", 128000, 2)):
+        plan = [(f"{t // 1000}K", t, r) for t, r in speed] if speed is not None else [("19K", 19000, 5), ("64K", 64000, 3), ("128K", 128000, 2)]
+        for name, tokens, reps in plan:
             for _ in range(1 if quick else reps):
                 seed += 1
                 _, row = srv.chat([{"role": "user", "content": word_prompt(tokens, seed)}], 1)
                 assert row["reuse"] == "none" or row["reused"] < 64, row
                 result["speed"].append({"size": name, "prefilled": row["prefilled"], "seconds": row["ttft_s"]})
                 print(f"  speed {name}: {row['prefilled']} tokens in {row['ttft_s']:.3f} s = {row['prefilled'] / row['ttft_s']:.0f} tok/s", flush=True)
-        sizes = [300, 1000, 3000, 8000, 20000, 40000, 64000, 120000]
+        sizes = [] if speed is not None else [300, 1000, 3000, 8000, 20000, 40000, 64000, 120000]
         for case, tokens in enumerate(sizes[:5] if quick else sizes):
             out, row = srv.chat([{"role": "user", "content": source_prompt(text, tokens, case)}], 160)
             result["outputs"].append({"case": f"cold-{tokens}", "prompt": row["prompt"], "prefilled": row["prefilled"], "text": out,
@@ -140,7 +173,7 @@ def run(label: str, exe: Path, cubin: Path | None, quick: bool, extra: dict[str,
             print(f"  output cold-{tokens}: prompt {row['prompt']}, {row['completion']} tokens, {row['tokens_per_verify']:.2f} tok/verify", flush=True)
         # A conversation: 8K, then a turn that adds about 3K (wide chunks from a non-zero start), then a short one.
         msgs = [{"role": "user", "content": source_prompt(text, 8000, 11)}]
-        for turn, more in enumerate((None, source_prompt(text, 3000, 12), "Now say the same in two sentences.")):
+        for turn, more in enumerate(() if speed is not None else (None, source_prompt(text, 3000, 12), "Now say the same in two sentences.")):
             if more:
                 msgs.append({"role": "user", "content": more})
             out, row = srv.chat(msgs, 120)
@@ -177,6 +210,16 @@ def cmp(base: str, label: str) -> int:
         at = next((i for i, (x, y) in enumerate(zip(o["text"], n["text"])) if x != y), min(len(o["text"]), len(n["text"])))
         print(f"output {o['case']:>12}: {'same' if same else f'DIFFERS at character {at} of {len(o["text"])}'}"
               f"   tok/verify {o['tokens_per_verify']:.2f} -> {n['tokens_per_verify']:.2f}")
+    sa, sb = a.get("small") or [], b.get("small") or []
+    if sa and sb:
+        for size in SMALL_SIZES:
+            xa = [r for r in sa if r["size"] == size and r["round"] > 0]
+            xb = [r for r in sb if r["size"] == size and r["round"] > 0]
+            ma, mb = statistics.median(r["seconds"] for r in xa), statistics.median(r["seconds"] for r in xb)
+            print(f"small turn, about {statistics.median(r['prefilled'] for r in xa):>4.0f} new tokens: {ma * 1e3:6.1f} -> {mb * 1e3:6.1f} ms ({ma / mb:.2f}x faster)"
+                  f"   reuse {sorted({r['reuse'] for r in xa + xb})}")
+        same = sum(x["text"] == y["text"] for x, y in zip(sa, sb))
+        print(f"small-turn replies with the same text: {same} of {min(len(sa), len(sb))} (later turns follow earlier replies, so one change carries on)")
     print("all outputs the same" if not differ else f"{differ} outputs differ")
     return 1 if differ else 0
 
@@ -189,7 +232,7 @@ def main() -> int:
         print(__doc__)
         return 2
     label, rest = args[1], args[2:]
-    exe, cubin, quick, extra = ROOT / "target" / "release" / "inkling.exe", None, False, {}
+    exe, cubin, quick, extra, speed, small = ROOT / "target" / "release" / "inkling.exe", None, False, {}, None, False
     while rest:
         a = rest.pop(0)
         if a == "--exe":
@@ -198,12 +241,16 @@ def main() -> int:
             cubin = Path(rest.pop(0)).resolve()
         elif a == "--quick":
             quick = True
+        elif a == "--small":
+            small = True
+        elif a == "--speed":
+            speed = [(int(t), int(r)) for t, r in (x.split(":") for x in rest.pop(0).split(","))]
         elif "=" in a:
             k, v = a.split("=", 1)
             extra[k] = v
         else:
             raise SystemExit(f"unknown argument {a}")
-    run(label, exe, cubin, quick, extra)
+    run(label, exe, cubin, quick, extra, speed, small)
     return 0
 
 

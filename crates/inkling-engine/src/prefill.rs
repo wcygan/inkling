@@ -204,11 +204,13 @@ pub struct WidePrefill<'a> {
     last_wide: std::cell::Cell<(usize, usize)>,
 }
 
-/// Prompts shorter than this (INKLING_WIDE_MIN, default 256 tokens) keep trunk's B <= 8 chunked prefill:
-/// they gain little from wide chunks (512 tokens: 0.46 -> 0.14 s), and the wide path's different summation
-/// order flipped one short held-out case (essay, 39 tokens).
+/// Ranges shorter than this (INKLING_WIDE_MIN, default 64 tokens) keep trunk's B <= 8 chunked prefill. Measured on
+/// follow-up turns at 8K to 12K context: with 64, turns of about 90, 160 and 240 new tokens reach their first
+/// token 1.2x, 1.8x and 1.7x sooner than with the earlier 256; with 16, turns of 30 to 50 tokens get 10 to 15%
+/// slower (a 16-token wide chunk costs more than two B = 8 steps). The wide path sums in a different order, so
+/// greedy text can change where two tokens are nearly tied (`inkling kld`: no more divergence from exact mode).
 fn wide_min() -> usize {
-    std::env::var("INKLING_WIDE_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
+    std::env::var("INKLING_WIDE_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
 }
 
 /// f32 to IEEE half bits, round to nearest even (finite, normal-range inputs such as rel_proj).

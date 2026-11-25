@@ -3,7 +3,7 @@
 A native Windows inference engine and OpenAI-compatible server for [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini),
 written in Rust with GPU kernels in Rust ([cuda-oxide](https://github.com/NVIDIA/cuda-rust)). It is built for one
 GPU, the **NVIDIA RTX 5090** (Blackwell, `sm_120a`), and for **long context**: with the full **256K-token** window
-in use, it decodes at about **278 tokens/s**, reads a completely full 256K-token prompt (about a 600-page book) in about **65 seconds**, and fits in about
+in use, it decodes at about **278 tokens/s**, reads a completely full 256K-token prompt (about a 600-page book) in about **55 seconds**, and fits in about
 **22.5 GiB** of the card's 32 GB. At short context it decodes at about 550 tokens/s.
 
 It gets there with:
@@ -44,31 +44,31 @@ The slope is the cost of reading a longer cache at every step.
 
 **Prefill, from an empty cache**
 
-Prefill is the time to read the prompt before the first token appears. It grows with prompt length, so the 256K time is for a prompt that fills the window. A short prompt takes a fraction of a second, and a 10K-token prompt takes about a second and a half.
+Prefill is the time to read the prompt before the first token appears. It grows with prompt length, so the 256K time is for a prompt that fills the window. A short prompt takes a fraction of a second, and a 10K-token prompt takes a little over a second.
 
 | Prompt | Time | Rate |
 | --- | ---: | ---: |
-| 1K tokens | 0.21 to 0.23 s | about 4,500 tok/s |
-| 10K tokens | 1.4 to 1.5 s | about 7,000 tok/s |
-| 32K tokens | 4.6 to 4.7 s | about 6,900 tok/s |
-| 64K tokens | 10.0 to 10.2 s | about 6,300 tok/s |
-| 128K tokens | 23.4 to 23.7 s | about 5,600 tok/s |
-| 256K tokens | 64.1 to 65.6 s | about 4,000 tok/s |
+| 1K tokens | 0.14 to 0.21 s | about 4,800 tok/s |
+| 10K tokens | 1.15 to 1.18 s | about 8,500 tok/s |
+| 32K tokens | 3.8 to 3.9 s | about 8,400 tok/s |
+| 64K tokens | 8.5 s | about 7,500 tok/s |
+| 128K tokens | 20.3 to 20.6 s | about 6,250 tok/s |
+| 256K tokens | 54.8 to 55.5 s | about 4,650 tok/s |
 
-The 1K to 64K rows were timed through the HTTP server on the final build: three runs each, random-word prompts that cannot reuse the cache, one output token, so each time includes about one decode step. The 128K and 256K rows are from earlier in-engine runs. The rate falls at long context because attention reads a longer cache.
+Every row was timed through the HTTP server on the current build (`scripts\prefill_bench.py run LABEL --speed ...`): three runs each, random-word prompts that cannot reuse the cache, one output token, so each time includes about one decode step. The rate falls at long context because attention reads a longer cache.
 
 Later turns of a conversation do not pay this again. The server keeps the cache, so only the new tokens are
 prefilled: a follow-up request that reused 80 of its 118 prompt tokens produced its first token in about 70 ms.
 
-**Memory:** 22.4 GiB at 256K context, with the 20 GB checkpoint loaded. Each saved cache state (for turn reuse) adds
-about 0.3 GB when used. The cache is allocated up front, so a smaller `max_ctx` uses less, by roughly 16 KiB for
+**Memory:** 22.5 GiB at 256K context, with the 20 GB checkpoint loaded. Each saved cache state (for turn reuse) adds
+about 0.36 GB when used. The cache is allocated up front, so a smaller `max_ctx` uses less, by roughly 16 KiB for
 every token of context removed (an estimate).
 
 ```mermaid
 pie showData
-    title GPU memory at 256K context, in GB (22.4 in total)
+    title GPU memory at 256K context, in GB (22.5 in total)
     "Checkpoint weights, mostly NVFP4 experts" : 12.40
-    "Attention cache: FP8 KV, rings, scratch" : 4.69
+    "Attention cache: FP8 KV, rings, scratch" : 4.73
     "Packed NVFP4 copies: dense, head, router" : 2.94
     "Wide prefill buffers" : 0.90
     "Drafter: weights and state" : 0.87
@@ -221,7 +221,7 @@ just serve --max-ctx 131072 --checkpoints 4
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `max_ctx` | 262144 | Context length in tokens. The KV cache is allocated up front, so a smaller value frees VRAM |
-| `checkpoints` | 6 | Saved cache states for turn reuse, about 0.3 GB each |
+| `checkpoints` | 6 | Saved cache states for turn reuse, about 0.36 GB each |
 | `effort` | `low` | Default reasoning effort (`reasoning_effort` in a request overrides it) |
 | `port` | 8013 | Listen port, on 127.0.0.1 only |
 | `kv_fp8`, `draft_kv_fp8` | true | FP8 KV cache for the model and for the drafter |
@@ -304,11 +304,12 @@ inkling load-check [--model-dir DIR]     load the weights and report time and VR
 inkling tokenize TEXT                    render TEXT with the chat template and print the token IDs
 inkling generate [--max-tokens N] TEXT   greedy generation for one user turn
 inkling bench [--mode fp8] [RUNS]        decode speed on a chat and a code prompt
+inkling kld FILE [PREFIX] [EVAL]         divergence of the shipped precisions from exact mode on FILE's text
 ```
 
 Run these as `target\release\inkling.exe ...`; they need the kernels built. Useful environment variables for the
 server: `INKLING_PORT`, `INKLING_CHECKPOINTS`, `INKLING_KV_FP8`, `INKLING_DRAFT_KV_FP8`, `INKLING_WIDE_PREFILL=0`
-(turn wide prefill off), `INKLING_WIDE_MIN` (the shortest prompt that uses it, 256 tokens by default) and
+(turn wide prefill off), `INKLING_WIDE_MIN` (the shortest range of new tokens that uses it, 64 by default) and
 `INKLING_WIDE_MAX=1024` (smaller prefill chunks, which use less VRAM). `scripts\inkling.py serve` sets the first
 four from the settings above.
 
