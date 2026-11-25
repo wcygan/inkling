@@ -4,6 +4,10 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 default:
     @just --list
 
+# Check that everything needed is installed, and say how to install what is missing
+doctor *args:
+    uv run --script scripts/inkling.py doctor {{ args }}
+
 # Show what is ready and what to do next
 status:
     uv run --script scripts/inkling.py status

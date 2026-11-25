@@ -6,6 +6,8 @@ written down as a [TLA+ model](InklingLifecycle.tla) and checked with TLC before
 two terminals running commands at the same time, files that change at any moment, and commands that are
 interrupted.
 
+`doctor` and `status` only read state, so they are not part of the model.
+
 ## The rules
 
 | Rule | Meaning | Where the tool enforces it |

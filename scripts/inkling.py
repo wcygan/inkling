@@ -5,6 +5,7 @@
 # ///
 """inkling: download the weights, build the GPU kernels, and run the server.
 
+    uv run --script scripts/inkling.py doctor          check that the tools are installed, and how to install the missing ones
     uv run --script scripts/inkling.py status          what is ready and what to do next
     uv run --script scripts/inkling.py weights         download the checkpoint, then verify it
     uv run --script scripts/inkling.py check-weights   verify the checkpoint against the pinned hashes
@@ -34,6 +35,7 @@ import hashlib
 import http.client
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -85,6 +87,7 @@ CONFIG_KEYS = {
     "pi_models_json": str,
 }
 EXIT_REFUSED = 2
+BS = chr(92)  # a backslash, for f-strings
 
 
 class Refused(Exception):
@@ -346,24 +349,217 @@ def _vs(paths: Paths, *cmd: str, cwd: Path | None = None, quiet: bool = False) -
     return _run(["cmd", "/c", str(paths.vsdev), *cmd], cwd=cwd, quiet=quiet)
 
 
-def kernel_prerequisites() -> list[str]:
-    missing = []
-    for tool, how in (("git", "winget install Git.Git"), ("cargo", "install Rust from https://rustup.rs"), ("uv", "winget install astral-sh.uv")):
-        if not shutil.which(tool):
-            missing.append(f"{tool} ({how})")
-    cuda = Path(os.environ.get("CUDA_PATH", r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.5"))
-    if not (cuda / "bin" / "nvcc.exe").is_file():
-        missing.append(f"the CUDA 13.5 Toolkit with nvcc (looked in {cuda}; set CUDA_PATH if it is elsewhere)")
+# ---- doctor: what must be installed, and how to install what is missing ------------------------------------
+STAGES = ("run", "weights", "build", "kernels")  # what the tools are needed for
+CUDA_MIN = (13, 5)
+DISK_NEEDED_GIB = 22  # the checkpoint (about 20 GB) and some room
+
+
+@dataclasses.dataclass
+class Check:
+    key: str
+    title: str
+    needed_for: tuple[str, ...]  # a subset of STAGES; optional checks may be empty
+    ok: bool
+    detail: str
+    fix: str = ""
+    optional: bool = False
+
+
+def _out(cmd: list[str], timeout: int = 30) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout + r.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def vs_install() -> Path | None:
+    """The Visual Studio 2022 (or Build Tools) install that has the C++ tools, found with vswhere."""
+    pf86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+    vswhere = pf86 / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.is_file():
+        out = _out([str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property", "installationPath"])
+        if out and (Path(out) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat").is_file():
+            return Path(out)
+    return None
+
+
+def cuda_dir() -> Path:
+    return Path(os.environ.get("CUDA_PATH", r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.5"))
+
+
+def cublas_dir() -> Path | None:
+    """The folder with cublas64_13.dll: on PATH, or in the CUDA Toolkit."""
+    for d in [*os.environ.get("PATH", "").split(os.pathsep), str(cuda_dir() / "bin" / "x64"), str(cuda_dir() / "bin")]:
+        if d and (Path(d) / "cublas64_13.dll").is_file():
+            return Path(d)
+    return None
+
+
+def _on_path(d: Path) -> bool:
+    return os.path.normcase(str(d)) in [os.path.normcase(x.rstrip("\\")) for x in os.environ.get("PATH", "").split(os.pathsep)]
+
+
+def _free_gib(path: Path) -> float:
+    p = path
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return shutil.disk_usage(p).free / 2**30
+
+
+def gpu_check() -> Check:
+    gpu = gpu_info()
+    smi = _out(["nvidia-smi"]) if gpu else ""
+    dm = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", smi)
+    drv = (int(dm.group(1)), int(dm.group(2))) if dm else None
+    if not gpu:
+        ok, detail = False, "nvidia-smi found no NVIDIA GPU or driver"
+    elif gpu["compute_cap"] != "12.0":
+        ok = False
+        detail = f"{gpu['name']} has compute capability {gpu['compute_cap']}; the kernels are built for {KERNEL_ARCH} (RTX 5090 class, 12.0)"
+    elif drv and drv < CUDA_MIN:
+        ok, detail = False, f"{gpu['name']}; the driver supports CUDA {drv[0]}.{drv[1]} and 13.5 is needed"
+    else:
+        ok = True
+        detail = f"{gpu['name']}, {gpu['total_gib']:.0f} GiB" + (f", driver supports CUDA {drv[0]}.{drv[1]}" if drv else "")
+    return Check("gpu", "NVIDIA RTX 5090 and driver", ("run", "kernels"), ok, detail,
+                 "install the current NVIDIA driver from https://www.nvidia.com/drivers (an RTX 5090, compute capability 12.0, is required)")
+
+
+def cublas_check() -> Check:
+    cb = cublas_dir()
+    if cb is None:
+        return Check("cublas", "cuBLAS 13 (cublas64_13.dll)", ("run",), False, "not found on PATH or in the CUDA Toolkit",
+                     "install the CUDA Toolkit (see above); it includes cuBLAS")
+    return Check("cublas", "cuBLAS 13 (cublas64_13.dll)", ("run",), True,
+                 f"{cb}" + ("" if _on_path(cb) else " (not on PATH; `inkling serve` adds it for the server)"))
+
+
+def run_checks(paths: Paths, model_dir: Path | None = None) -> list[Check]:
+    """Every tool the commands need, in the order to install them. Each check says what it is needed for and how to fix it."""
+    model_dir = model_dir or default_model_dir()
+    out: list[Check] = []
+
+    def add(*a, **k) -> None:
+        out.append(Check(*a, **k))
+
+    ok = platform.machine().upper() in ("AMD64", "X86_64")
+    add("os", "Windows x64", STAGES, ok, f"{platform.system()} {platform.release()} {platform.machine()}",
+        "" if ok else "this project runs on Windows x64 only")
+
+    uv = shutil.which("uv")
+    add("uv", "uv", ("weights",), bool(uv), (_out([uv, "--version"]) if uv else "not found"), "winget install --id astral-sh.uv -e")
+
+    git = shutil.which("git")
+    add("git", "git", ("kernels",), bool(git), (_out([git, "--version"]) if git else "not found"), "winget install --id Git.Git -e")
+
+    rustup, cargo = shutil.which("rustup"), shutil.which("cargo")
+    toolchain = paths.root / "rust-toolchain.toml"
+    pinned = re.search(r'channel\s*=\s*"([^"]+)"', toolchain.read_text()) if toolchain.is_file() else None
+    channel = pinned.group(1) if pinned else "the pinned toolchain"
+    if rustup and cargo:
+        have = channel in _out([rustup, "toolchain", "list"])
+        detail = f"rustup found; Rust {channel} " + ("is installed" if have else "installs itself on the first build (needs network)")
+    else:
+        detail = "not found"
+    add("rust", "Rust (rustup)", ("build", "kernels"), bool(rustup and cargo), detail, "winget install --id Rustlang.Rustup -e")
+
+    vs = vs_install()
+    add("msvc", "Visual Studio C++ tools", ("build", "kernels"), vs is not None, str(vs) if vs else "not found",
+        'winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--passive --wait '
+        '--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"')
+
+    nvcc = cuda_dir() / "bin" / "nvcc.exe"
+    m = re.search(r"release (\d+)\.(\d+)", _out([str(nvcc), "--version"])) if nvcc.is_file() else None
+    ver = (int(m.group(1)), int(m.group(2))) if m else None
+    cuda_ok = ver is not None and ver >= CUDA_MIN
+    if cuda_ok:
+        cuda_detail = f"CUDA {ver[0]}.{ver[1]} at {cuda_dir()}"
+    elif ver:
+        cuda_detail = f"CUDA {ver[0]}.{ver[1]} found at {cuda_dir()}; 13.5 or newer is needed"
+    else:
+        cuda_detail = f"nvcc not found in {cuda_dir()}"
+    add("cuda", "CUDA Toolkit 13.5 (nvcc)", ("kernels",), cuda_ok, cuda_detail,
+        "winget install --id Nvidia.CUDA --version 13.5 -e   (if the installer offers a display driver, keep your current one; "
+        "if CUDA is installed elsewhere, set CUDA_PATH)")
+
     clang = Path(os.environ.get("LIBCLANG_PATH", r"C:\Program Files\LLVM\bin"))
-    if not (clang / "libclang.dll").is_file():
-        missing.append(f"LLVM with libclang.dll (winget install LLVM.LLVM; looked in {clang}; set LIBCLANG_PATH if it is elsewhere)")
+    has_clang = (clang / "libclang.dll").is_file()
+    add("llvm", "LLVM (libclang)", ("kernels",), has_clang, str(clang) if has_clang else f"libclang.dll not found in {clang}",
+        "winget install --id LLVM.LLVM -e   (if LLVM is installed elsewhere, set LIBCLANG_PATH)")
+
     vcpkg = Path(os.environ.get("VCPKG_ROOT", r"C:\vcpkg"))
-    if not list((vcpkg / "installed" / "x64-windows" / "lib").glob("ffi*.lib")):
-        missing.append(f"libffi from vcpkg (vcpkg install libffi:x64-windows; looked under {vcpkg}; set VCPKG_ROOT if it is elsewhere)")
-    editions = ("Community", "BuildTools", "Professional", "Enterprise")
-    if not any((Path(r"C:\Program Files\Microsoft Visual Studio\2022") / e / "VC/Auxiliary/Build/vcvars64.bat").is_file() for e in editions):
-        missing.append("Visual Studio 2022 with the C++ workload (scripts/vsdev.cmd calls its vcvars64.bat)")
-    return missing
+    ffi = list((vcpkg / "installed" / "x64-windows" / "lib").glob("ffi*.lib"))
+    add("libffi", "libffi (vcpkg)", ("kernels",), bool(ffi), f"found under {vcpkg}" if ffi else f"not found under {vcpkg}",
+        f"git clone https://github.com/microsoft/vcpkg {vcpkg}; {vcpkg}{BS}bootstrap-vcpkg.bat -disableMetrics; "
+        f"{vcpkg}{BS}vcpkg.exe install libffi:x64-windows   (if vcpkg is elsewhere, set VCPKG_ROOT)")
+
+    out.append(gpu_check())
+    out.append(cublas_check())
+
+    w, _ = weights_state(paths, model_dir)
+    if w in ("absent", "partial"):
+        free = _free_gib(model_dir)
+        add("disk", f"{DISK_NEEDED_GIB} GiB of free disk for the weights", ("weights",), free >= DISK_NEEDED_GIB,
+            f"{free:.0f} GiB free on the drive of {model_dir}",
+            "free some space, or put the checkpoint on another drive with --model-dir or `model_dir` in serve.config.json")
+    else:
+        add("disk", "disk space for the weights", ("weights",), True, "the checkpoint is already downloaded")
+
+    have_just = bool(shutil.which("just"))
+    add("just", "just (shortcuts)", (), have_just, "found" if have_just else "not found; use `uv run --script scripts/inkling.py ...` instead",
+        "winget install --id Casey.Just -e", optional=True)
+    have_pi = bool(shutil.which("pi"))
+    add("pi", "Pi coding agent", (), have_pi, "found" if have_pi else "not found",
+        "npm i -g @mariozechner/pi-coding-agent   (needs Node.js)", optional=True)
+    return out
+
+
+def failing(checks: list[Check], stage: str) -> list[Check]:
+    return [c for c in checks if not c.ok and not c.optional and stage in c.needed_for]
+
+
+def _describe(c: Check) -> str:
+    return f"{c.title}: {c.detail}" + (f". Install: {c.fix}" if c.fix else "")
+
+
+def refuse_if_missing(paths: Paths, stage: str, model_dir: Path | None = None) -> None:
+    bad = failing(run_checks(paths, model_dir), stage)
+    if bad:
+        raise Refused([_describe(c) for c in bad] + ["`inkling doctor` checks everything and lists the commands"])
+
+
+def kernel_prerequisites() -> list[str]:
+    return [_describe(c) for c in failing(run_checks(P), "kernels")]
+
+
+def render_doctor(checks: list[Check], stage: str) -> tuple[list[str], int]:
+    shown = [c for c in checks if stage == "all" or stage in c.needed_for or c.optional]
+    def needed(c: Check) -> str:
+        if c.optional:
+            return "optional"
+        stages = [s for s in c.needed_for if stage in ("all", s)]
+        return "needed for everything" if len(stages) == len(STAGES) else "needed for " + ", ".join(stages)
+
+    width, nwidth = max(len(c.title) for c in shown), max(len(needed(c)) for c in shown)
+    lines = []
+    for c in shown:
+        mark = "ok" if c.ok else ("skip" if c.optional else "MISSING")
+        lines.append(f"  [{mark:<7}] {c.title:<{width}}  {needed(c):<{nwidth}}  {c.detail}")
+    missing = [c for c in shown if not c.ok and not c.optional]
+    optional = [c for c in shown if not c.ok and c.optional]
+    lines.append("")
+    if missing:
+        lines.append(f"{len(missing)} required item(s) missing. Install them in this order (PowerShell; some installers ask for approval):")
+        lines += [f"  {i}. {c.fix}" for i, c in enumerate(missing, 1) if c.fix]
+        lines.append("Then open a NEW terminal, so the installs are on PATH, and run `inkling doctor` again.")
+    else:
+        lines.append("Everything needed is installed." if stage == "all" else f"Everything needed for `{stage}` is installed.")
+    if optional:
+        lines.append("Optional: " + "; ".join(f"{c.title}: {c.fix}" for c in optional))
+    return lines, (EXIT_REFUSED if missing else 0)
 
 
 def build_kernels(paths: Paths) -> None:
@@ -557,11 +753,7 @@ def serve_checks(paths: Paths, s: Settings, unverified_ok: bool) -> list[str]:
     k, kwhy = kernel_state(paths)
     if k != "fresh":
         why.append(f"the GPU kernels are {k} ({kwhy[0]}). Build them: `inkling kernels`")
-    gpu = gpu_info()
-    if not gpu:
-        why.append("nvidia-smi found no NVIDIA GPU or driver")
-    elif gpu["compute_cap"] != "12.0":
-        why.append(f"the kernels are built for {KERNEL_ARCH} (RTX 5090 class); this GPU is {gpu['name']} (compute capability {gpu['compute_cap']})")
+    why += [_describe(c) for c in (gpu_check(), cublas_check()) if not c.ok]
     owner = port_owner(s.port)
     if owner and not any(r["ProcessId"] == owner["ProcessId"] for r in our_servers(paths)):
         why.append(f"port {s.port} is used by {owner.get('ExecutablePath') or 'another program'} (pid {owner['ProcessId']}), which is not this repository's server. Stop it or choose another --port")
@@ -594,6 +786,7 @@ def sync_pi(path: str, port: int, max_ctx: int) -> None:
 
 
 def build_host(paths: Paths) -> None:
+    refuse_if_missing(paths, "build")
     step("building the engine (cargo build --release --locked -p inkling-cli)")
     if _vs(paths, "cargo", "build", "--release", "--locked", "-p", "inkling-cli", cwd=paths.root) != 0 or not paths.exe.is_file():
         raise Failed("the engine did not build; read the output above")
@@ -619,7 +812,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     gpu = gpu_info()
     exe = P.exe.is_file()
     if args.json:
-        say(json.dumps({"weights": w, "kernels": k, "engine": exe, "server": srv, "model_dir": str(s.model_dir), "gpu": gpu}, indent=1))
+        say(json.dumps({"weights": w, "kernels": k, "engine": exe, "server": srv, "missing_tools": [c.key for c in run_checks(P, s.model_dir) if not c.ok and not c.optional], "model_dir": str(s.model_dir), "gpu": gpu}, indent=1))
         return 0
     say(f"weights   {w:<9} {s.model_dir}" + (f"  ({wwhy[0]})" if wwhy else ""))
     say(f"kernels   {k:<9}" + (f"  ({kwhy[0]})" if kwhy else ""))
@@ -627,6 +820,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     say(f"server    {srv:<9} http://127.0.0.1:{s.port}/v1" if srv != "stopped" else "server    stopped")
     say(f"gpu       {gpu.get('name', 'not found')}" + (f"  {gpu['free_gib']:.1f} of {gpu['total_gib']:.1f} GiB free" if gpu else ""))
     todo = []
+    missing = [c for c in run_checks(P, s.model_dir) if not c.ok and not c.optional]
+    if missing:
+        say(f"setup     {len(missing)} required tool(s) missing: " + ", ".join(c.title for c in missing))
+        todo.append("inkling doctor")
     if w in ("absent", "partial"):
         todo.append("inkling weights")
     elif w == "present":
@@ -639,6 +836,18 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    s = load_settings(P, args)
+    checks = run_checks(P, s.model_dir)
+    if args.json:
+        say(json.dumps([dataclasses.asdict(c) for c in checks], indent=1))
+        return 0 if not [c for c in checks if not c.ok and not c.optional and (args.stage == "all" or args.stage in c.needed_for)] else EXIT_REFUSED
+    lines, code = render_doctor(checks, args.stage)
+    for line in lines:
+        say(line)
+    return code
+
+
 def cmd_weights(args: argparse.Namespace) -> int:
     s = load_settings(P, args)
     with command_lock(P, "weights"):
@@ -649,6 +858,7 @@ def cmd_weights(args: argparse.Namespace) -> int:
             say("The checkpoint is already downloaded and verified. Use --force to download it again.")
             return 0
         if state in ("absent", "partial") or args.force:
+            refuse_if_missing(P, "weights", s.model_dir)
             uv = shutil.which("uv")
             if not uv:
                 raise Refused("uv is needed to run the Hugging Face downloader (winget install astral-sh.uv)")
@@ -710,6 +920,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 "--effort", s.effort, "--model-dir", str(s.model_dir)]
         env = dict(os.environ, INKLING_PORT=str(s.port), INKLING_CHECKPOINTS=str(s.checkpoints),
                    INKLING_SERVE_LOG=str(P.logs / "serve-log.jsonl"))
+        cb = cublas_dir()
+        if cb and not _on_path(cb):
+            env["PATH"] = f"{cb}{os.pathsep}{env.get('PATH', '')}"
         for name, on in (("INKLING_KV_FP8", s.kv_fp8), ("INKLING_DRAFT_KV_FP8", s.draft_kv_fp8)):
             env.pop(name, None)
             if on:
@@ -759,6 +972,11 @@ def build_parser() -> argparse.ArgumentParser:
     common(p)
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("doctor", help="check that everything needed is installed, and say how to install what is missing")
+    common(p)
+    p.add_argument("--for", dest="stage", choices=("all", *STAGES), default="all", help="check only what one stage needs")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_doctor)
     p = sub.add_parser("weights", help="download the checkpoint at the pinned revision, then verify it")
     common(p)
     p.add_argument("--force", action="store_true", help="download again even if the checkpoint is verified")

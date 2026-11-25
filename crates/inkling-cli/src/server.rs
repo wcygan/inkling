@@ -117,10 +117,38 @@ fn tool_args(body: &str, json_form: bool) -> Option<Json> {
 }
 
 /// The raw text of the `args` object inside a (possibly partial) `{"name":…,"args":{…}}` body, as it
-/// streams; complete bodies drop the outer closing brace.
+/// streams. Once the args object closes, the text ends at its own closing brace, whether or not the
+/// outer `}` or the end marker has been decoded yet: a streamed delta can't be taken back, so a stray
+/// outer `}` sent early would reach the client as `{…}}`.
 fn args_text(body: &str, complete: bool) -> Option<&str> {
     let i = body.find("\"args\":")? + "\"args\":".len();
     let rest = &body[i..];
+    let object = rest.trim_start();
+    if object.starts_with('{') {
+        let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+        for (at, c) in object.char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+            } else if c == '"' {
+                in_string = true;
+            } else if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&object[..at + 1]);
+                }
+            }
+        }
+        return Some(object); // still inside the args object
+    }
+    // Args that are not an object are rejected by `tool_args`; keep the old text for them.
     Some(if complete { rest.trim_end().strip_suffix('}').unwrap_or(rest) } else { rest })
 }
 
@@ -1423,6 +1451,25 @@ mod tests {
             Seg::Tool { body, complete: false, .. } => assert_eq!(args_text(body, false), Some("{\"path\":\"x")),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn streamed_args_never_include_the_outer_brace() {
+        // The outer `}` can be decoded one step before the end marker, while `complete` is still false.
+        let args = "{\"command\":\"grep -n \\\"a}b\\\\|{x\\\" f | head\"}";
+        let full = format!("{{\"name\":\"bash\",\"args\":{args}}}");
+        for cut in 1..=full.len() {
+            if !full.is_char_boundary(cut) {
+                continue;
+            }
+            let streamed = args_text(&full[..cut], false).unwrap_or("");
+            assert!(args.starts_with(streamed), "cut {cut}: {streamed}");
+            if cut >= full.len() - 1 {
+                assert_eq!(streamed, args, "cut {cut}");
+            }
+        }
+        assert_eq!(args_text(&full, true), Some(args));
+        assert_eq!(args_text("{\"name\":\"t\",\"args\":\"s\"}", true), Some("\"s\""));
     }
 
     #[test]

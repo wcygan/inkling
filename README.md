@@ -12,9 +12,26 @@ GPU, the **NVIDIA RTX 5090** (Blackwell, `sm_120a`), and runs the model with:
 `inkling serve` speaks the OpenAI chat API (streaming, reasoning, tool calls) and reuses the cache across turns,
 so it works as the backend for coding agents such as [Pi](https://www.npmjs.com/package/@mariozechner/pi-coding-agent).
 
+## Start here
+
+On a new machine the only thing to install by hand is `uv`. Everything else is checked for you:
+
+```powershell
+winget install --id astral-sh.uv -e
+setup.cmd                 # or: uv run --script scripts\inkling.py doctor
+```
+
+`doctor` checks every tool the project needs (the NVIDIA driver, CUDA 13.5, the Visual Studio C++ tools, Rust, LLVM,
+libffi, git, free disk space), says which step needs each one, and prints the `winget` command for every tool that is
+missing, in the order to run them. It installs nothing itself. Run the commands it lists, open a **new** terminal so
+the installs are on `PATH`, and run it again until it says everything is installed. `doctor --for run` checks only
+what running the server needs, and the other commands refuse with the same recommendation when something they need
+is missing.
+
 ## Quick start
 
 ```powershell
+just doctor          # is everything installed? how to install what is missing
 just status          # what is ready, and the next step
 just weights         # download the checkpoint (about 20 GB) and verify it
 just kernels         # build the GPU kernels from source (the first run fetches cuda-oxide)
@@ -23,10 +40,12 @@ just serve           # start the server on http://127.0.0.1:8013/v1
 ```
 
 Without `just`, run `uv run --script scripts\inkling.py <command>` (`status`, `weights`, `check-weights`,
-`kernels`, `build`, `serve`, `stop`). `status` always tells you what to run next, and every command that cannot run
+`doctor`, `kernels`, `build`, `serve`, `stop`). `status` always tells you what to run next, and every command that cannot run
 yet says why and what to do, so you can run them in any order and the tool will tell you.
 
 ## Requirements
+
+`just doctor` checks all of this and tells you how to install what is missing.
 
 | | |
 | --- | --- |
